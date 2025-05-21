@@ -22,6 +22,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
@@ -962,6 +963,15 @@ func (d *Driver) ControllerExpandVolume(ctx context.Context, req *csi.Controller
 	}, nil
 }
 
+func countKeys(m *sync.Map) int64 {
+	count := int64(0)
+	m.Range(func(key, value any) bool {
+		count++
+		return true
+	})
+	return count
+}
+
 // CreateSnapshot create a snapshot
 func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequest) (*csi.CreateSnapshotResponse, error) {
 	sourceVolumeID := req.GetSourceVolumeId()
@@ -971,6 +981,25 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 	snapshotName := req.Name
 	if len(snapshotName) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "snapshot name must be provided")
+	}
+
+	if _, ok := d.currentConcurrentSnapshotOpMap.Load(sourceVolumeID); !ok {
+		d.currentConcurrentSnapshotOpMap.Store(sourceVolumeID, struct{}{})
+		// update maximum concurrency
+		for {
+			newConcurrency := countKeys(&d.currentConcurrentSnapshotOpMap)
+			existingMaxConcurrency := d.maxConcurrentSnapshotOpCount.Load()
+			if newConcurrency > existingMaxConcurrency {
+				if d.maxConcurrentSnapshotOpCount.CompareAndSwap(existingMaxConcurrency, newConcurrency) {
+					klog.V(2).Infof("Concurrent maximum snapshot: (%s) %d\n", sourceVolumeID, newConcurrency)
+					break
+				} else {
+					klog.V(2).Infof("Concurrent maximum snapshot (%s) conflict: %d:%d\n", sourceVolumeID, existingMaxConcurrency, newConcurrency)
+					continue
+				}
+			}
+			break
+		}
 	}
 
 	snapshotName = azureutils.CreateValidDiskName(snapshotName)
@@ -1166,6 +1195,12 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 	createResp := &csi.CreateSnapshotResponse{
 		Snapshot: csiSnapshot,
 	}
+
+	if csiSnapshot.ReadyToUse {
+		d.currentConcurrentSnapshotOpMap.Delete(sourceVolumeID)
+		klog.V(2).Infof("Snapshot ready and removed: %s\n", sourceVolumeID)
+	}
+
 	isOperationSucceeded = true
 	return createResp, nil
 }
