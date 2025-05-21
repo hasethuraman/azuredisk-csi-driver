@@ -25,6 +25,8 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v6"
@@ -149,6 +151,10 @@ type Driver struct {
 	throttlingCache azcache.Resource
 	// a timed cache for disk lun collision check throttling
 	checkDiskLunThrottlingCache azcache.Resource
+	// current concurrent snapshot operation atomic count
+	currentConcurrentSnapshotOpMap sync.Map
+	// maximum concurrent snapshot operation atomic count
+	maxConcurrentSnapshotOpCount atomic.Int64
 }
 
 // newDriverV1 Creates a NewCSIDriver object. Assumes vendor version is equal to driver version &
@@ -198,6 +204,7 @@ func newDriverV1(options *DriverOptions) *Driver {
 	driver.volumeLocks = volumehelper.NewVolumeLocks()
 	driver.ioHandler = azureutils.NewOSIOHandler()
 	driver.hostUtil = hostutil.NewHostUtil()
+	driver.maxConcurrentSnapshotOpCount = atomic.Int64{}
 
 	if driver.NodeID == "" {
 		// nodeid is not needed in controller component
