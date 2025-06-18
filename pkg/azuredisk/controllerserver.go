@@ -1119,13 +1119,14 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 			return nil, status.Error(codes.Internal, fmt.Sprintf("waitForSnapshotReady(%s, %s, %s) failed with %v", subsID, resourceGroup, snapshotName, err))
 		}
 	}
+	klog.V(2).Infof("create snapshot(%s) under rg(%s) region(%s) successfully", snapshotName, resourceGroup, d.cloud.Location)
 
 	csiSnapshot, err := d.getSnapshotByID(ctx, subsID, resourceGroup, snapshotName, sourceVolumeID)
 	if err != nil {
 		return nil, err
 	}
 
-	if !isOperationInProgress && crossRegionSnapshotName != "" {
+	if csiSnapshot.ReadyToUse && crossRegionSnapshotName != "" {
 		copySnapshot := snapshot
 		if copySnapshot.Properties == nil {
 			copySnapshot.Properties = &armcompute.SnapshotProperties{}
