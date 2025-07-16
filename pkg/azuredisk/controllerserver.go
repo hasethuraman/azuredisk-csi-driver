@@ -437,6 +437,38 @@ func (d *Driver) ControllerModifyVolume(ctx context.Context, req *csi.Controller
 		SourceType:         consts.SourceVolume,
 	}
 
+	// SKU Migration Validation - Integration Point
+	if skuName != "" && d.enableSkuMigrationValidator {
+		// Get current disk information for validation
+		currentDisk, diskErr := d.diskController.GetDiskByURI(ctx, diskURI)
+		if diskErr != nil {
+			klog.Warningf("Failed to get current disk information for validation: %v", diskErr)
+		} else if currentDisk != nil && currentDisk.SKU != nil {
+			currentSKU := *currentDisk.SKU.Name
+			targetSKU := skuName
+
+			// Only validate if this is actually a SKU change
+			if currentSKU != targetSKU {
+				klog.V(2).Infof("Validating SKU migration: %s -> %s for disk %s",
+					currentSKU, targetSKU, diskURI)
+
+				validationStart := time.Now()
+				if err := d.skuMigrationValidator.ValidateMigration(ctx, currentDisk, currentSKU, targetSKU, diskParams); err != nil {
+					validationDuration := time.Since(validationStart)
+					klog.Errorf("SKU migration validation failed: %s -> %s for disk %s (took %v): %v",
+						currentSKU, targetSKU, diskURI, validationDuration, err)
+
+					return nil, status.Errorf(codes.InvalidArgument,
+						"SKU migration validation failed for %s -> %s: %v", currentSKU, targetSKU, err)
+				}
+
+				validationDuration := time.Since(validationStart)
+				klog.V(2).Infof("SKU migration validation successful: %s -> %s for disk %s (took %v)",
+					currentSKU, targetSKU, diskURI, validationDuration)
+			}
+		}
+	}
+
 	mc := metrics.NewMetricContext(consts.AzureDiskCSIDriverName, "controller_modify_volume", d.cloud.ResourceGroup, d.cloud.SubscriptionID, d.Name)
 	isOperationSucceeded := false
 	defer func() {

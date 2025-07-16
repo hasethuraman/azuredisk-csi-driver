@@ -1,0 +1,60 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: azuredisk-sku-migration-config
+  namespace: kube-system
+data:
+  config.json: |
+    {
+      "migrationPairs": {
+        "Premium_LRS->PremiumV2_LRS": {
+          "enabled": true,
+          "validationRules": {
+            "RegionSupport": {
+              "enabled": true,
+              "params": {
+                "supportedRegions": [
+                  "eastus", "westus2", "northeurope", "westeurope",
+                  "eastasia", "southeastasia", "japaneast", "australiaeast",
+                  "uksouth", "francecentral", "canadacentral", "brazilsouth",
+                  "centralindia", "koreacentral"
+                ]
+              }
+            },
+            "CachingMode": {
+              "enabled": true,
+              "params": {
+                "allowedModes": ["None"]
+              }
+            },
+            "EnableBursting": {
+              "enabled": true,
+              "params": {
+                "allowBursting": false
+              }
+            },
+            "DiskEncryptionType": {
+              "enabled": true,
+              "params": {
+                "allowedTypes": [
+                  "EncryptionAtRestWithPlatformKey",
+                  "EncryptionAtRestWithCustomerKey"
+                ]
+              }
+            },
+            "LogicalSectorSize": {
+              "enabled": true,
+              "params": {
+                "requiredSize": 512
+              }
+            },
+            "PerfProfile": {
+              "enabled": true,
+              "params": {
+                "allowedProfiles": ["", "basic"]
+              }
+            }
+          }
+        }
+      }
+    }

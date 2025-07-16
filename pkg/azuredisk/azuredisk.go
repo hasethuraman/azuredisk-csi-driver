@@ -139,6 +139,12 @@ type Driver struct {
 	throttlingCache azcache.Resource
 	// a timed cache for disk lun collision check throttling
 	checkDiskLunThrottlingCache azcache.Resource
+	// enableSkuMigrationValidator indicates whether the SKU migration validator is enabled
+	enableSkuMigrationValidator bool
+	// a ConfigurableSKUMigrationValidator to validate SKU migration rules
+	skuMigrationValidator ConfigurableSKUMigrationValidator
+	// a map to store the migration config
+	skuMigatonConfigManager *SkuMigrationConfigManager
 }
 
 // NewDriver Creates a NewCSIDriver object. Assumes vendor version is equal to driver version &
@@ -597,6 +603,47 @@ func (d *Driver) getUsedLunsFromNode(ctx context.Context, nodeName k8stypes.Node
 		usedLuns = append(usedLuns, int(*disk.Lun))
 	}
 	return usedLuns, nil
+}
+
+// initializeSKUMigrationValidator initializes the SKU migration validation framework
+func (d *Driver) initializeSKUMigrationValidator() error {
+	if d.enableSkuMigrationValidator == false {
+		klog.V(2).Infof("SKU migration validation is disabled")
+		return nil
+	}
+
+	if d.kubeClient == nil {
+		klog.V(2).Infof("Kubernetes client not available, SKU migration validation disabled")
+		return nil
+	}
+
+	// Initialize configuration manager
+	configManager := NewSkuMigrationConfigManager(
+		d.kubeClient,
+		"azuredisk-sku-migration-config",
+		"kube-system")
+
+	// Load initial configuration
+	if err := configManager.LoadConfig(); err != nil {
+		klog.Warningf("Failed to load SKU migration configuration, using defaults: %v", err)
+	}
+
+	// Start auto-refresh every 5 minutes
+	configManager.StartAutoRefresh(5 * time.Minute)
+
+	// Initialize validator
+	d.skuMigrationValidator = NewConfigurableSKUMigrationValidator(configManager)
+	d.skuMigatonConfigManager = configManager
+
+	klog.V(2).Infof("SKU migration validation framework initialized")
+	return nil
+}
+
+// Stop stops the driver and cleans up resources
+func (d *Driver) Stop() {
+	if d.skuMigatonConfigManager != nil {
+		d.skuMigatonConfigManager.Stop()
+	}
 }
 
 // getNodeInfoFromLabels get zone, instanceType from node labels

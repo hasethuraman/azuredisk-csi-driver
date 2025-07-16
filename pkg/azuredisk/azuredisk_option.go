@@ -43,6 +43,7 @@ type DriverOptions struct {
 	AllowEmptyCloudConfig             bool
 	EnableListVolumes                 bool
 	EnableListSnapshots               bool
+	EnableSkuMigrationValidator       bool
 	SupportZone                       bool
 	GetNodeInfoFromLabels             bool
 	EnableDiskCapacityCheck           bool
@@ -93,6 +94,7 @@ func (o *DriverOptions) AddFlags() *flag.FlagSet {
 	fs.BoolVar(&o.AllowEmptyCloudConfig, "allow-empty-cloud-config", true, "Whether allow running driver without cloud config")
 	fs.BoolVar(&o.EnableListVolumes, "enable-list-volumes", false, "boolean flag to enable ListVolumes on controller")
 	fs.BoolVar(&o.EnableListSnapshots, "enable-list-snapshots", false, "boolean flag to enable ListSnapshots on controller")
+	fs.BoolVar(&o.EnableSkuMigrationValidator, "enable-sku-migration-validator", true, "boolean flag to enable SKU migration validation")
 	fs.BoolVar(&o.SupportZone, "support-zone", true, "boolean flag to get zone info in NodeGetInfo")
 	fs.BoolVar(&o.GetNodeInfoFromLabels, "get-node-info-from-labels", false, "boolean flag to get zone info from node labels in NodeGetInfo")
 	fs.BoolVar(&o.EnableDiskCapacityCheck, "enable-disk-capacity-check", false, "boolean flag to enable volume capacity check in CreateVolume")

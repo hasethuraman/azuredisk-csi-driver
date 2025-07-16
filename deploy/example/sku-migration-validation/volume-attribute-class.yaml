@@ -1,0 +1,12 @@
+apiVersion: storage.k8s.io/v1alpha1
+kind: VolumeAttributesClass
+metadata:
+  name: premium2-migration
+driverName: disk.csi.azure.com
+parameters:
+  skuName: PremiumV2_LRS
+  cachingMode: none
+  enableBursting: false
+  LogicalSectorSize: "512"
+  DiskIOPSReadWrite: "3000"
+  DiskMBpsReadWrite: "125"
