@@ -438,6 +438,10 @@ func (d *Driver) ControllerModifyVolume(ctx context.Context, req *csi.Controller
 	}
 
 	// SKU Migration Validation - Integration Point
+	var isSkuMigration bool
+	var currentSKU, targetSKU string
+
+	// Track if this is a SKU migration for monitoring
 	if skuName != "" && d.enableSkuMigrationValidator {
 		// Get current disk information for validation
 		currentDisk, diskErr := d.diskController.GetDiskByURI(ctx, diskURI)
@@ -449,6 +453,7 @@ func (d *Driver) ControllerModifyVolume(ctx context.Context, req *csi.Controller
 
 			// Only validate if this is actually a SKU change
 			if currentSKU != targetSKU {
+				isSkuMigration = true
 				klog.V(2).Infof("Validating SKU migration: %s -> %s for disk %s",
 					currentSKU, targetSKU, diskURI)
 
@@ -485,7 +490,45 @@ func (d *Driver) ControllerModifyVolume(ctx context.Context, req *csi.Controller
 	isOperationSucceeded = true
 	klog.V(2).Infof("modify azure disk(%s) account type(%s) rg(%s) location(%s) successfully", diskParams.DiskName, skuName, diskParams.ResourceGroup, diskParams.Location)
 
+	// Start migration monitoring if this was a SKU migration
+	if isSkuMigration && d.migrationProgressMonitor != nil {
+		// Get PV name for event reporting
+		pvName := d.getPVNameFromVolumeID(volumeID)
+		if pvName != "" {
+			if err := d.migrationProgressMonitor.StartMigrationMonitoring(
+				ctx, diskURI, pvName, currentSKU, targetSKU); err != nil {
+				klog.Warningf("Failed to start migration monitoring for disk %s: %v", diskURI, err)
+				// Don't fail the request, just log the warning
+			}
+		} else {
+			klog.V(2).Infof("PV name not found for volume %s, skipping migration monitoring", volumeID)
+		}
+	}
+
 	return &csi.ControllerModifyVolumeResponse{}, err
+}
+
+// getPVNameFromVolumeID extracts PV name from volume ID by looking up PVs
+func (d *Driver) getPVNameFromVolumeID(volumeID string) string {
+	if d.kubeClient == nil {
+		return ""
+	}
+
+	// List all PVs and find the one with matching volumeHandle
+	pvList, err := d.kubeClient.CoreV1().PersistentVolumes().List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		klog.Warningf("Failed to list PersistentVolumes: %v", err)
+		return ""
+	}
+
+	for _, pv := range pvList.Items {
+		if pv.Spec.CSI != nil && pv.Spec.CSI.VolumeHandle == volumeID {
+			return pv.Name
+		}
+	}
+
+	klog.V(4).Infof("PersistentVolume not found for volume ID %s", volumeID)
+	return ""
 }
 
 // ControllerPublishVolume attach an azure disk to a required node

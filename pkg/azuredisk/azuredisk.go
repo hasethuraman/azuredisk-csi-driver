@@ -36,10 +36,14 @@ import (
 
 	grpcprom "github.com/grpc-ecosystem/go-grpc-middleware/providers/prometheus"
 	corev1 "k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
+	typedv1core "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/volume/util/hostutil"
 	"k8s.io/mount-utils"
@@ -145,6 +149,10 @@ type Driver struct {
 	skuMigrationValidator ConfigurableSKUMigrationValidator
 	// a map to store the migration config
 	skuMigatonConfigManager *SkuMigrationConfigManager
+	// eventRecorder for emitting Kubernetes events
+	eventRecorder record.EventRecorder
+	// migrationProgressMonitor tracks disk migration progress
+	migrationProgressMonitor *MigrationProgressMonitor
 }
 
 // NewDriver Creates a NewCSIDriver object. Assumes vendor version is equal to driver version &
@@ -323,6 +331,27 @@ func NewDriver(options *DriverOptions) *Driver {
 			removeTaintInBackground(kubeClient, driver.NodeID, driver.Name, taintRemovalBackoff, removeNotReadyTaint)
 		})
 	}
+
+	// Initialize migration progress monitor
+	if driver.cloud != nil && kubeClient != nil && driver.eventRecorder != nil {
+		eventBroadcaster := record.NewBroadcaster()
+		eventBroadcaster.StartRecordingToSink(&typedv1core.EventSinkImpl{
+			Interface: kubeClient.CoreV1().Events(""),
+		})
+		driver.eventRecorder = eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{
+			Component: "azuredisk-csi-controller",
+		})
+		klog.V(2).Infof("Event recorder initialized")
+		driver.migrationProgressMonitor = NewMigrationProgressMonitor(
+			kubeClient,
+			driver.eventRecorder,
+			driver.diskController,
+		)
+		klog.V(2).Infof("Migration progress monitor initialized")
+	}
+
+	driver.initializeSKUMigrationValidator()
+
 	return &driver
 }
 
