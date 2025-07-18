@@ -18,6 +18,7 @@ package azuredisk
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -33,6 +34,8 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 	consts "sigs.k8s.io/azuredisk-csi-driver/pkg/azureconstants"
 	"sigs.k8s.io/azuredisk-csi-driver/pkg/azuredisk/mockcorev1"
@@ -680,19 +683,23 @@ func TestControllerGetVolume(t *testing.T) {
 func TestControllerModifyVolume(t *testing.T) {
 	cntl := gomock.NewController(t)
 	defer cntl.Finish()
-	d, err := NewFakeDriver(cntl)
-	if err != nil {
-		t.Fatalf("Error getting driver: %v", err)
-	}
+	d := getFakeDriverWithKubeClient(cntl)
 	storageAccountTypeUltraSSDLRS := armcompute.DiskStorageAccountTypesUltraSSDLRS
 
+	// Initialize migration monitor with the fake driver's kube client
+	mockEventRecorder := record.NewFakeRecorder(100)
+	d.SetMigrationMonitor(NewMigrationProgressMonitor(d.getCloud().KubeClient, mockEventRecorder, d.GetDiskController()))
+
 	tests := []struct {
-		desc            string
-		req             *csi.ControllerModifyVolumeRequest
-		oldSKU          *armcompute.DiskStorageAccountTypes
-		expectedResp    *csi.ControllerModifyVolumeResponse
-		expectedErrCode codes.Code
-		expectedErrmsg  string
+		desc                   string
+		req                    *csi.ControllerModifyVolumeRequest
+		oldSKU                 *armcompute.DiskStorageAccountTypes
+		expectedResp           *csi.ControllerModifyVolumeResponse
+		expectedErrCode        codes.Code
+		expectedErrmsg         string
+		expectMigrationStarted bool
+		setupPVMocks           bool
+		pvExists               bool
 	}{
 		{
 			desc: "success standard",
@@ -703,32 +710,90 @@ func TestControllerModifyVolume(t *testing.T) {
 					consts.DiskMBPSReadWriteField: "100",
 				},
 			},
-			oldSKU:       &storageAccountTypeUltraSSDLRS,
-			expectedResp: &csi.ControllerModifyVolumeResponse{},
+			oldSKU:                 &storageAccountTypeUltraSSDLRS,
+			expectedResp:           &csi.ControllerModifyVolumeResponse{},
+			expectMigrationStarted: false,
+		},
+		{
+			desc: "success SKU migration from Premium_LRS to PremiumV2_LRS",
+			req: &csi.ControllerModifyVolumeRequest{
+				VolumeId: testVolumeID,
+				MutableParameters: map[string]string{
+					consts.SkuNameField: string(armcompute.DiskStorageAccountTypesPremiumV2LRS),
+				},
+			},
+			oldSKU:                 to.Ptr(armcompute.DiskStorageAccountTypesPremiumLRS),
+			expectedResp:           &csi.ControllerModifyVolumeResponse{},
+			expectMigrationStarted: true,
+			setupPVMocks:           true,
+			pvExists:               true,
+		},
+		{
+			desc: "success SKU migration from Standard_LRS to Premium_LRS",
+			req: &csi.ControllerModifyVolumeRequest{
+				VolumeId: testVolumeID,
+				MutableParameters: map[string]string{
+					consts.SkuNameField: string(armcompute.DiskStorageAccountTypesPremiumLRS),
+				},
+			},
+			oldSKU:                 to.Ptr(armcompute.DiskStorageAccountTypesStandardLRS),
+			expectedResp:           &csi.ControllerModifyVolumeResponse{},
+			expectMigrationStarted: true,
+			setupPVMocks:           true,
+			pvExists:               true,
+		},
+		{
+			desc: "no migration for same SKU",
+			req: &csi.ControllerModifyVolumeRequest{
+				VolumeId: testVolumeID,
+				MutableParameters: map[string]string{
+					consts.SkuNameField: string(armcompute.DiskStorageAccountTypesPremiumLRS),
+				},
+			},
+			oldSKU:                 to.Ptr(armcompute.DiskStorageAccountTypesPremiumLRS),
+			expectedResp:           &csi.ControllerModifyVolumeResponse{},
+			expectMigrationStarted: false,
+		},
+		{
+			desc: "migration started even when PV not found",
+			req: &csi.ControllerModifyVolumeRequest{
+				VolumeId: testVolumeID,
+				MutableParameters: map[string]string{
+					consts.SkuNameField: string(armcompute.DiskStorageAccountTypesPremiumV2LRS),
+				},
+			},
+			oldSKU:                 to.Ptr(armcompute.DiskStorageAccountTypesPremiumLRS),
+			expectedResp:           &csi.ControllerModifyVolumeResponse{},
+			expectMigrationStarted: true,
+			setupPVMocks:           true,
+			pvExists:               false,
 		},
 		{
 			desc: "fail with no volume id",
 			req: &csi.ControllerModifyVolumeRequest{
 				VolumeId: "",
 			},
-			expectedResp:    nil,
-			expectedErrCode: codes.InvalidArgument,
+			expectedResp:           nil,
+			expectedErrCode:        codes.InvalidArgument,
+			expectMigrationStarted: false,
 		},
 		{
 			desc: "fail with the invalid diskURI",
 			req: &csi.ControllerModifyVolumeRequest{
 				VolumeId: "123",
 			},
-			expectedResp:    nil,
-			expectedErrCode: codes.NotFound,
+			expectedResp:           nil,
+			expectedErrCode:        codes.NotFound,
+			expectMigrationStarted: false,
 		},
 		{
 			desc: "fail with wrong disk name",
 			req: &csi.ControllerModifyVolumeRequest{
 				VolumeId: "/subscriptions/123",
 			},
-			expectedResp:    nil,
-			expectedErrCode: codes.NotFound,
+			expectedResp:           nil,
+			expectedErrCode:        codes.NotFound,
+			expectMigrationStarted: false,
 		},
 		{
 			desc: "fail with wrong sku name",
@@ -738,8 +803,9 @@ func TestControllerModifyVolume(t *testing.T) {
 					consts.SkuNameField: "ut",
 				},
 			},
-			expectedResp:    nil,
-			expectedErrCode: codes.InvalidArgument,
+			expectedResp:           nil,
+			expectedErrCode:        codes.InvalidArgument,
+			expectMigrationStarted: false,
 		},
 		{
 			desc: "fail with error parse parameter",
@@ -749,8 +815,9 @@ func TestControllerModifyVolume(t *testing.T) {
 					consts.DiskIOPSReadWriteField: "ut",
 				},
 			},
-			expectedResp:    nil,
-			expectedErrCode: codes.InvalidArgument,
+			expectedResp:           nil,
+			expectedErrCode:        codes.InvalidArgument,
+			expectMigrationStarted: false,
 		},
 		{
 			desc: "fail with unsupported sku",
@@ -761,34 +828,127 @@ func TestControllerModifyVolume(t *testing.T) {
 					consts.DiskIOPSReadWriteField: "100",
 				},
 			},
-			expectedResp:    nil,
-			expectedErrCode: codes.Internal,
+			expectedResp:           nil,
+			expectedErrCode:        codes.Internal,
+			expectMigrationStarted: false,
 		},
 	}
 
 	for _, test := range tests {
-		ctx, cancel := context.WithCancel(context.TODO())
-		defer cancel()
-		id := test.req.VolumeId
-		disk := &armcompute.Disk{
-			ID: &id,
-			SKU: &armcompute.DiskSKU{
-				Name: test.oldSKU,
-			},
-			Properties: &armcompute.DiskProperties{},
-		}
-		diskClient := mock_diskclient.NewMockInterface(cntl)
-		d.getClientFactory().(*mock_azclient.MockClientFactory).EXPECT().GetDiskClientForSub(gomock.Any()).Return(diskClient, nil).AnyTimes()
-		diskClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(disk, nil).AnyTimes()
-		diskClient.EXPECT().Patch(gomock.Eq(ctx), gomock.Any(), gomock.Any(), gomock.Any()).Return(disk, nil).AnyTimes()
+		t.Run(test.desc, func(t *testing.T) {
+			// Reset migration monitor for each test
+			if d.GetMigrationMonitor() != nil {
+				d.GetMigrationMonitor().Stop()
+			}
+			d.SetMigrationMonitor(NewMigrationProgressMonitor(d.getCloud().KubeClient, mockEventRecorder, d.GetDiskController()))
 
-		result, err := d.ControllerModifyVolume(ctx, test.req)
-		if err != nil {
-			checkTestError(t, test.expectedErrCode, err)
-		}
-		if !reflect.DeepEqual(result, test.expectedResp) {
-			t.Errorf("input request: %v, ControllerModifyVolume result: %v, expected: %v", test.req, result, test.expectedResp)
-		}
+			ctx, cancel := context.WithCancel(context.TODO())
+			defer cancel()
+			id := test.req.VolumeId
+			disk := &armcompute.Disk{
+				ID: &id,
+				SKU: &armcompute.DiskSKU{
+					Name: test.oldSKU,
+				},
+				Properties: &armcompute.DiskProperties{},
+			}
+
+			// Setup disk client mocks
+			diskClient := mock_diskclient.NewMockInterface(cntl)
+			d.getClientFactory().(*mock_azclient.MockClientFactory).EXPECT().GetDiskClientForSub(gomock.Any()).Return(diskClient, nil).AnyTimes()
+			diskClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(disk, nil).AnyTimes()
+			diskClient.EXPECT().Patch(gomock.Eq(ctx), gomock.Any(), gomock.Any(), gomock.Any()).Return(disk, nil).AnyTimes()
+
+			// Setup PV mocks for migration monitoring if needed
+			if test.setupPVMocks {
+				testPV := &v1.PersistentVolume{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: testVolumeName,
+					},
+				}
+
+				// Get the mock PV interface from the fake driver's kube client
+				pvInterface := d.getCloud().KubeClient.CoreV1().PersistentVolumes()
+
+				if test.pvExists {
+					pvInterface.(*mockpersistentvolume.MockInterface).EXPECT().Get(gomock.Any(), testVolumeName, gomock.Any()).
+						Return(testPV, nil).AnyTimes()
+				} else {
+					pvInterface.(*mockpersistentvolume.MockInterface).EXPECT().Get(gomock.Any(), testVolumeName, gomock.Any()).
+						Return(nil, errors.New("not found")).AnyTimes()
+				}
+			}
+
+			result, err := d.ControllerModifyVolume(ctx, test.req)
+			if err != nil {
+				checkTestError(t, test.expectedErrCode, err)
+			}
+			if !reflect.DeepEqual(result, test.expectedResp) {
+				t.Errorf("input request: %v, ControllerModifyVolume result: %v, expected: %v", test.req, result, test.expectedResp)
+			}
+
+			// Verify migration monitoring state
+			if test.expectMigrationStarted {
+				assert.True(t, d.GetMigrationMonitor().IsMigrationActive(test.req.VolumeId),
+					"Migration should be active for test: %s", test.desc)
+
+				activeMigrations := d.GetMigrationMonitor().GetActiveMigrations()
+				assert.Equal(t, 1, len(activeMigrations),
+					"Should have exactly one active migration for test: %s", test.desc)
+
+				migration, exists := activeMigrations[test.req.VolumeId]
+				assert.True(t, exists, "Migration should exist for volume ID: %s", test.req.VolumeId)
+				assert.Equal(t, test.req.VolumeId, migration.DiskURI)
+				assert.Equal(t, testVolumeName, migration.PVName)
+
+				// Verify SKU change details if this is a migration test
+				if newSKU, exists := test.req.MutableParameters[consts.SkuNameField]; exists && test.oldSKU != nil {
+					assert.Equal(t, armcompute.DiskStorageAccountTypes(newSKU), migration.ToSKU)
+					assert.Equal(t, *test.oldSKU, migration.FromSKU)
+				}
+
+				// Verify migration started event was emitted for successful cases
+				if test.expectedErrCode == codes.OK && test.setupPVMocks {
+					select {
+					case event := <-mockEventRecorder.Events:
+						assert.Contains(t, event, "Normal", "Event should be Normal type")
+						assert.Contains(t, event, ReasonSKUMigrationStarted, "Event should contain migration started reason")
+						assert.Contains(t, event, testVolumeName, "Event should contain PV name")
+						if test.oldSKU != nil {
+							assert.Contains(t, event, string(*test.oldSKU), "Event should contain source SKU")
+						}
+						if newSKU, exists := test.req.MutableParameters[consts.SkuNameField]; exists {
+							assert.Contains(t, event, newSKU, "Event should contain target SKU")
+						}
+					default:
+						t.Errorf("Expected migration started event was not recorded for test: %s", test.desc)
+					}
+				}
+			} else {
+				assert.False(t, d.GetMigrationMonitor().IsMigrationActive(test.req.VolumeId),
+					"Migration should NOT be active for test: %s", test.desc)
+
+				activeMigrations := d.GetMigrationMonitor().GetActiveMigrations()
+				assert.Equal(t, 0, len(activeMigrations),
+					"Should have no active migrations for test: %s", test.desc)
+
+				// Verify no events were emitted for non-migration cases
+				select {
+				case event := <-mockEventRecorder.Events:
+					// Only error if this is not a migration case or if it's an error case
+					if !test.expectMigrationStarted && test.expectedErrCode == codes.OK {
+						t.Errorf("Unexpected event recorded for test %s: %s", test.desc, event)
+					}
+				default:
+					// Expected - no events should be recorded for non-migration cases
+				}
+			}
+
+			// Clean up migration monitor
+			if d.GetMigrationMonitor() != nil {
+				d.GetMigrationMonitor().Stop()
+			}
+		})
 	}
 }
 
