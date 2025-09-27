@@ -22,7 +22,12 @@ NAMESPACE="${NAMESPACE:-}"
 MAX_PVCS="${MAX_PVCS:-50}"
 POLL_INTERVAL="${POLL_INTERVAL:-120}"
 WAIT_FOR_WORKLOAD="${WAIT_FOR_WORKLOAD:-true}"
-MIGRATION_FORCE_INPROGRESS_AFTER_MINUTES="${MIGRATION_FORCE_INPROGRESS_AFTER_MINUTES:-10}"
+MIGRATION_FORCE_INPROGRESS_AFTER_MINUTES="${MIGRATION_FORCE_INPROGRESS_AFTER_MINUTES:-3}"
+
+# In-place rollback keys
+ROLLBACK_PVC_YAML_ANN="${ROLLBACK_PVC_YAML_ANN:-disk.csi.azure.com/rollback-pvc-yaml}"
+ROLLBACK_ORIG_PV_ANN="${ROLLBACK_ORIG_PV_ANN:-disk.csi.azure.com/rollback-orig-pv}"
+
 # Maximum PVC size (in GiB) eligible for migration (default 2TiB = 2048GiB). PVCs >= this are skipped.
 MAX_PVC_CAPACITY_GIB="${MAX_PVC_CAPACITY_GIB:-2048}"
 declare -a AUDIT_LINES=()
@@ -34,7 +39,8 @@ PVC_BACKUP_DIR="${PVC_BACKUP_DIR:-pvc-backups}"
 # ---------- Timeouts ----------
 BIND_TIMEOUT_SECONDS="${BIND_TIMEOUT_SECONDS:-60}"
 MONITOR_TIMEOUT_MINUTES="${MONITOR_TIMEOUT_MINUTES:-300}"
-WORKLOAD_DETACH_TIMEOUT_MINUTES="${WORKLOAD_DETACH_TIMEOUT_MINUTES:-0}"
+WORKLOAD_DETACH_TIMEOUT_MINUTES="${WORKLOAD_DETACH_TIMEOUT_MINUTES:-5}"
+EXIT_ON_WORKLOAD_DETACH_TIMEOUT="${EXIT_ON_WORKLOAD_DETACH_TIMEOUT:-false}"
 
 # ---------- Kubectl retry configurations ----------
 KUBECTL_MAX_RETRIES="${KUBECTL_MAX_RETRIES:-5}"
@@ -47,7 +53,8 @@ CREATED_BY_LABEL_KEY="${CREATED_BY_LABEL_KEY:-disk.csi.azure.com/created-by}"
 MIGRATION_TOOL_ID="${MIGRATION_TOOL_ID:-azuredisk-pv1-to-pv2-migrator}"
 MIGRATION_DONE_LABEL_KEY="${MIGRATION_DONE_LABEL_KEY:-disk.csi.azure.com/migration-done}"
 MIGRATION_DONE_LABEL_VALUE="${MIGRATION_DONE_LABEL_VALUE:-true}"
-MIGRATION_INPROGRESS_LABEL_KEY="${MIGRATION_INPROGRESS_LABEL_KEY:-disk.csi.azure.com/migration-inprogress}"
+MIGRATION_DONE_LABEL_VALUE_FALSE="${MIGRATION_DONE_LABEL_VALUE_FALSE:-false}"
+MIGRATION_INPROGRESS_LABEL_KEY="${MIGRATION_INPROGRESS_LABEL_KEY:-disk.csi.azure.com/migration-in-progress}"
 MIGRATION_INPROGRESS_LABEL_VALUE="${MIGRATION_INPROGRESS_LABEL_VALUE:-true}"
 
 audit_add() {
@@ -90,7 +97,7 @@ finalize_audit_summary() {
     echo "  (no mutating actions recorded)"
   else
     echo
-    info "Best-effort revert command summary:"
+    info "Best-effort summary to revert if required:"
     local line act revert
     for line in "${AUDIT_LINES[@]}"; do
       IFS='|' read -r _ act _ _ _ revert _ <<<"$line"
@@ -175,7 +182,8 @@ name_csi_pvc() { local pvc="$1"; echo "${pvc}-${MIG_SUFFIX}"; }
 name_csi_pv()  { local pv="$1"; echo "${pv}-${MIG_SUFFIX}"; }
 name_snapshot(){ local pv="$1"; echo "ss-$(name_csi_pv "$pv")"; }
 name_pv2_pvc() { local pvc="$1"; echo "${pvc}-${MIG_SUFFIX}-pv2"; }
-name_pv2_pvc_suffix() { name_pv2_pvc "$@"; }  # legacy alias
+name_pv1_sc()  { local sc="$1"; echo "${sc}-pv1"; }
+name_pv2_sc()  { local sc="$1"; echo "${sc}-pv2"; }
 
 # ---------- Utilities ----------
 require_bins() {
@@ -256,7 +264,15 @@ mark_source_done() {
   kcmd label pvc "$pvc" -n "$pvc_ns" "${MIGRATION_DONE_LABEL_KEY}=${MIGRATION_DONE_LABEL_VALUE}" --overwrite
   audit_add "PersistentVolumeClaim" "$pvc" "$pvc_ns" "label" \
     "kubectl label pvc $pvc -n $pvc_ns ${MIGRATION_DONE_LABEL_KEY}-" \
-    "done=true"
+    "done=${MIGRATION_DONE_LABEL_VALUE}"
+}
+
+remove_migration_done_label() {
+  local pvc_ns="$1" pvc="$2"
+  kcmd label pvc "$pvc" -n "$pvc_ns" "${MIGRATION_DONE_LABEL_KEY}-" --overwrite
+  audit_add "PersistentVolumeClaim" "$pvc" "$pvc_ns" "label-remove" \
+    "kubectl label pvc $pvc -n $pvc_ns ${MIGRATION_DONE_LABEL_KEY}=" \
+    "remove done label"
 }
 
 wait_pvc_bound() {
@@ -270,18 +286,182 @@ wait_pvc_bound() {
   return 1
 }
 
+get_pvc_encoded_json() {
+  local pvc="$1" ns="$2"
+  local orig_json
+  orig_json=$(kcmd get pvc "$pvc" -n "$ns" -o json | jq '{
+      apiVersion,
+      kind,
+      metadata: {
+        name: .metadata.name,
+        namespace: .metadata.namespace,
+        labels: (.metadata.labels // {}),
+        annotations: (
+          (.metadata.annotations // {})
+          | with_entries(
+              select(
+                .key
+                | test("^(pv\\.kubernetes\\.io/|volume\\.kubernetes\\.io/|kubectl\\.kubernetes\\.io/|control-plane\\.|kubernetes\\.io/created-by)$")
+                | not
+              )
+            )
+        )
+      },
+      spec
+    }')
+    # Base64 encode sanitized JSON for rollback annotation
+    printf '%s' "$orig_json" | jq 'del(.status) | {
+        apiVersion,
+        kind,
+        metadata: {
+          name: .metadata.name,
+          namespace: .metadata.namespace,
+          labels: (.metadata.labels // {}),
+          annotations: (
+            (.metadata.annotations // {})
+            | with_entries(
+                select(
+                  .key
+                  | test("^(pv\\.kubernetes\\.io/|volume\\.kubernetes\\.io/|kubectl\\.kubernetes\\.io/|control-plane\\.|kubernetes\\.io/created-by)$")
+                  | not
+                )
+              )
+          )
+        },
+        spec
+      }' | b64e
+}
+
+get_pv_encoded_json() {
+  local pvc="$1" ns="$2"
+  local orig_json
+  local pv
+
+  pv=$(get_pv_of_pvc "$ns" "$pvc")
+
+  [[ -z "$pv" ]] && { err "Original PVC has no bound PV (cannot proceed)"; return 1; }
+
+  orig_json=$(kcmd get pv "$pv" -o json | jq '{
+      apiVersion,
+      kind,
+      metadata: {
+        name: .metadata.name,
+        labels: (.metadata.labels // {}),
+        annotations: (
+          (.metadata.annotations // {})
+          | with_entries(
+              select(
+                .key
+                | test("^(pv\\.kubernetes\\.io/|volume\\.kubernetes\\.io/|kubectl\\.kubernetes\\.io/|control-plane\\.|kubernetes\\.io/created-by)$")
+                | not
+              )
+            )
+        )
+      },
+      spec
+    }')
+    # Base64 encode sanitized JSON for rollback annotation
+    printf '%s' "$orig_json" | jq 'del(.status) | {
+        apiVersion,
+        kind,
+        metadata: {
+          name: .metadata.name,
+          labels: (.metadata.labels // {}),
+          annotations: (
+            (.metadata.annotations // {})
+            | with_entries(
+                select(
+                  .key
+                  | test("^(pv\\.kubernetes\\.io/|volume\\.kubernetes\\.io/|kubectl\\.kubernetes\\.io/|control-plane\\.|kubernetes\\.io/created-by)$")
+                  | not
+                )
+              )
+          )
+        },
+        spec
+      }' | b64e
+}
+
+backup_pvc() {
+  local pvc="$1" ns="$2"
+  if [[ "${BACKUP_ORIGINAL_PVC}" == "true" ]]; then
+    mkdir -p "${PVC_BACKUP_DIR}/${ns}"
+    local stamp tmp_file backup_file sc
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    tmp_file="${PVC_BACKUP_DIR}/${ns}/${pvc}-${stamp}.yaml.tmp"
+    backup_file="${PVC_BACKUP_DIR}/${ns}/${pvc}-${stamp}.yaml"
+    sc=$(kcmd get pvc "$pvc" -n "$ns" -o jsonpath='{.spec.storageClassName}' 2>/dev/null || true)
+
+    if ! kcmd get pvc "$pvc" -n "$ns" -o yaml >"$tmp_file" 2>/dev/null; then
+      err "Failed to fetch PVC $ns/$pvc for backup; skipping migration of this PVC."
+      audit_add "PersistentVolumeClaim" "$pvc" "$ns" "backup-failed" "kubectl get pvc $pvc -n $ns -o yaml" "dest=$tmp_file reason=kubectlError"
+      return 1
+    fi
+    if [[ ! -s "$tmp_file" ]] || ! grep -q '^kind: *PersistentVolumeClaim' "$tmp_file"; then
+      err "Backup validation failed for $ns/$pvc (empty or malformed); skipping migration."
+      rm -f "$tmp_file"
+      audit_add "PersistentVolumeClaim" "$pvc" "$ns" "backup-invalid" "kubectl get pvc $pvc -n $ns -o yaml" "dest=$backup_file reason=validation"
+      return 1
+    fi
+    mv "$tmp_file" "$backup_file"
+    audit_add "PersistentVolumeClaim" "$pvc" "$ns" "backup" "rm -f $backup_file" "dest=$backup_file size=$(wc -c <"$backup_file")B sc=${sc}"
+  fi
+}
+
 create_csi_pv_pvc() {
-  local pvc="$1" ns="$2" pv="$3" size="$4" mode="$5" sc="$6" diskURI="$7"
+  local pvc="$1" ns="$2" pv="$3" size="$4" mode="$5" sc="$6" diskURI="$7" inplace="${8:-false}"
   local csi_pv csi_pvc
+  local encoded_spec encoded_pv
+  local pv_before
+
+  # check if MIGRATION_LABEL_KEY exists on source pvc and its value is MIGRATION_LABEL_VALUE
+  if kcmd get pvc "$pvc" -n "$ns" -o json | jq -e --arg key "$MIGRATION_LABEL_KEY" --arg value "$MIGRATION_LABEL_VALUE" '.metadata.labels[$key]==$value' >/dev/null; then
+    migration_label_exists=true
+  fi
+
   csi_pv="$(name_csi_pv "$pv")"
   csi_pvc="$(name_csi_pvc "$pvc")"
+  if $inplace; then
+    csi_pvc="$pvc"
+  fi
   if kcmd get pvc "$csi_pvc" -n "$ns" >/dev/null 2>&1; then
     kcmd get pvc "$csi_pvc" -n "$ns" -o json | jq -e --arg key "$CREATED_BY_LABEL_KEY" --arg tool "$MIGRATION_TOOL_ID" '.metadata.labels[$key]==$tool' >/dev/null \
       && { info "Intermediate PVC $ns/$csi_pvc exists"; return; }
-    warn "Intermediate PVC $ns/$csi_pvc exists but missing label"
-    return
+    if ! $inplace; then
+      warn "Intermediate PVC $ns/$csi_pvc exists but missing label"
+      return
+    fi
   fi
-  info "Creating intermediate PV/PVC $csi_pv / $csi_pvc"
+  encoded_spec=""
+  encoded_pv=""
+  pv_before=""
+  if [[ $inplace == true ]]; then
+    encoded_pv=$(get_pv_encoded_json "$pvc" $ns)
+    pv_before=$(get_pv_of_pvc "$ns" "$pvc")
+
+    backup_pvc "$pvc" "$ns" || {
+      warn "PVC backup failed $ns/$pvc"
+    }
+    # Base64 encode sanitized JSON for rollback annotation
+    encoded_spec=$(get_pvc_encoded_json "$pvc" "$ns")
+    ensure_reclaim_policy_retain "$pv"
+    if ! kcmd delete pvc "$csi_pvc" -n "$ns" --wait=true >/dev/null 2>&1; then
+      warn "Deleted preexisting PVC $ns/$csi_pvc for inplace recreation"
+      audit_add "PersistentVolumeClaim" "$csi_pvc" "$ns" "delete" "N/A" "inplace=true reason=preexisting"
+      return 1
+    fi
+    audit_add "PersistentVolumeClaim" "$csi_pvc" "$ns" "delete" "N/A" "inplace=true reason=preexisting"
+
+    if ! kcmd patch pv "$pv" -p '{"spec":{"claimRef":null}}' >/dev/null 2>&1; then
+      warn "Clear claimRef failed for PV $pv"
+      audit_add "PersistentVolumeClaim" "$pvc" "$ns" "rollback-clear-claimref-failed" "kubectl describe pv $pv" "reason=patchError"
+      return 1
+    fi
+    info "Recreating inplace CSI (from intree) PV/PVC $pv / $csi_pvc -> $csi_pv / $csi_pvc"
+  else
+    info "Creating intermediate PV/PVC $csi_pv / $csi_pvc"
+  fi
+
   if ! kapply_retry <<EOF
 apiVersion: v1
 kind: PersistentVolume
@@ -289,7 +469,6 @@ metadata:
   name: $csi_pv
   labels:
     ${CREATED_BY_LABEL_KEY}: ${MIGRATION_TOOL_ID}
-    ${MIGRATION_LABEL_KEY}: "${MIGRATION_LABEL_VALUE}"
   annotations:
     pv.kubernetes.io/provisioned-by: disk.csi.azure.com
 spec:
@@ -312,7 +491,7 @@ spec:
       requestedsizegib: "$size"
       skuname: Premium_LRS
   persistentVolumeReclaimPolicy: Retain
-  storageClassName: ${sc}-pv1
+  storageClassName: $sc
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -320,8 +499,11 @@ metadata:
   name: $csi_pvc
   namespace: $ns
   labels:
-    disk.csi.azure.com/pvc: "true"
     ${CREATED_BY_LABEL_KEY}: ${MIGRATION_TOOL_ID}
+$( [[ $inplace == true && $migration_label_exists == true ]] && echo "    ${MIGRATION_LABEL_KEY}: \"${MIGRATION_LABEL_VALUE}\"" )
+$( [[ -n $encoded_spec && -n ${ROLLBACK_PVC_YAML_ANN:-} ]] && echo "  annotations:" )
+$( [[ -n $encoded_spec && -n ${ROLLBACK_PVC_YAML_ANN:-} ]] && echo "    ${ROLLBACK_PVC_YAML_ANN}: $encoded_spec" )
+$( [[ -n $pv_before && -n ${ROLLBACK_ORIG_PV_ANN:-} ]] && echo "    ${ROLLBACK_ORIG_PV_ANN}: $pv_before" )
 spec:
   accessModes:
   - ReadWriteOnce
@@ -329,19 +511,140 @@ spec:
   resources:
     requests:
       storage: $size
-  storageClassName: ${sc}-pv1
+  storageClassName: $sc
   volumeName: $csi_pv
 EOF
   then
     audit_add "PersistentVolume" "$csi_pv" "" "create-failed" "N/A" "intermediate=true sourceDiskURI=$diskURI reason=applyFailure"
-    audit_add "PersistentVolumeClaim" "$csi_pvc" "$ns" "create-failed" "N/A" "intermediate=true sc=${sc}-pv1 reason=applyFailure"
+    audit_add "PersistentVolumeClaim" "$csi_pvc" "$ns" "create-failed" "N/A" "intermediate=true sc=$sc reason=applyFailure"
     return
   else
     audit_add "PersistentVolume" "$csi_pv" "" "create" "kubectl delete pv $csi_pv" "intermediate=true sourceDiskURI=$diskURI"
-    audit_add "PersistentVolumeClaim" "$csi_pvc" "$ns" "create" "kubectl delete pvc $csi_pvc -n $ns" "intermediate=true sc=${sc}-pv1"
+    audit_add "PersistentVolumeClaim" "$csi_pvc" "$ns" "create" "kubectl delete pvc $csi_pvc -n $ns" "intermediate=true sc=$sc"
+
+    if $inplace; then
+      # remove ROLLBACK_PVC_YAML_ANN annotation from pvc
+      kcmd annotate pvc "$csi_pvc" -n "$ns" "${ROLLBACK_PVC_YAML_ANN}-" --overwrite >/dev/null 2>&1 || true
+      kcmd annotate pvc "$csi_pvc" -n "$ns" "${ROLLBACK_ORIG_PV_ANN}-" --overwrite >/dev/null 2>&1 || true
+    fi
   fi
-  kcmd wait pvc "$csi_pvc" -n "$ns" --for=jsonpath='{.status.phase}=Bound' --timeout=120s >/dev/null 2>&1 || \
-    warn "Intermediate PVC $ns/$csi_pvc not bound in time"
+
+  if wait_pvc_bound "$ns" "$csi_pvc" "$BIND_TIMEOUT_SECONDS"; then
+    ok "PVC $ns/$csi_pvc bound"
+    audit_add "PersistentVolumeClaim" "$csi_pvc" "$ns" "bound" "kubectl describe pvc $csi_pvc -n $ns" "csi=true"
+    return 0
+  fi
+
+  warn "Intermediate PVC $ns/$csi_pvc not bound within timeout (${BIND_TIMEOUT_SECONDS}s)"
+  audit_add "PersistentVolumeClaim" "$csi_pvc" "$ns" "bind-timeout" "kubectl describe pvc $csi_pvc -n $ns" "csi=true timeout=${BIND_TIMEOUT_SECONDS}s"
+  return 2
+}
+
+create_pvc_from_snapshot() {
+  local pvc="$1" ns="$2" pv="$3" size="$4" mode="$5" sc="$6" destpvc="$7" snapshot="$8"
+  local inplace
+  local encoded_spec
+  local migration_label_exists
+  local encoded_spec encoded_pv
+  local pv_before
+
+  if [[ "$destpvc" != "$pvc" ]]; then
+    inplace=false
+  else
+    inplace=true
+  fi
+
+  # check if MIGRATION_LABEL_KEY exists on source pvc and its value is MIGRATION_LABEL_VALUE
+  if kcmd get pvc "$pvc" -n "$ns" -o json | jq -e --arg key "$MIGRATION_LABEL_KEY" --arg value "$MIGRATION_LABEL_VALUE" '.metadata.labels[$key]==$value' >/dev/null; then
+    migration_label_exists=true
+  fi
+
+  if kcmd get pvc "$destpvc" -n "$ns" >/dev/null 2>&1; then
+    kcmd get pvc "$destpvc" -n "$ns" -o json | jq -e --arg key "$CREATED_BY_LABEL_KEY" --arg tool "$MIGRATION_TOOL_ID" '.metadata.labels[$key]==$tool' >/dev/null \
+      && { info "PVC $ns/$destpvc exists"; return; }
+    if ! $inplace; then
+      warn "PVC $ns/$destpvc exists but missing label"
+      return
+    fi
+  fi
+
+  encoded_spec=""
+  encoded_pv=""
+  pv_before=""
+  if [[ "$destpvc" == "$pvc" ]]; then
+    inplace=true
+    pv_before=$(get_pv_of_pvc "$ns" "$pvc")
+
+    backup_pvc "$pvc" "$ns" || {
+        warn "PVC (snapshot creation path) backup failed $ns/$pvc"
+    }
+
+    encoded_spec=$(get_pvc_encoded_json "$pvc" "$ns")
+    ensure_reclaim_policy_retain "$pv"
+
+    if ! kcmd delete pvc "$pvc" -n "$ns" --wait=true >/dev/null 2>&1; then
+      warn "Deleted preexisting PVC $ns/$pvc for inplace recreation"
+      audit_add "PersistentVolumeClaim" "$pvc" "$ns" "delete-failed" "N/A" "inplace=true reason=preexisting"
+      return 1
+    fi
+    audit_add "PersistentVolumeClaim" "$pvc" "$ns" "delete" "N/A" "inplace=true reason=preexisting"
+
+    if ! kcmd patch pv "$pv" -p '{"spec":{"claimRef":null}}' >/dev/null 2>&1; then
+      warn "Clear claimRef failed for PV $pv"
+      audit_add "PersistentVolumeClaim" "$pvc" "$ns" "rollback-clear-claimref-failed" "kubectl describe pv $pv" "reason=patchError"
+      return 1
+    fi
+    info "Recreating inplace CSI (from snapshot) PV/PVC $snapshot -> $pv / $destpvc"
+  fi
+
+  info "Creating PVC $ns/$destpvc"
+  if ! kapply_retry <<EOF
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: $destpvc
+  namespace: $ns
+  labels:
+    ${CREATED_BY_LABEL_KEY}: ${MIGRATION_TOOL_ID}
+$( [[ $inplace == true && $migration_label_exists == true ]] && echo "    ${MIGRATION_LABEL_KEY}: \"${MIGRATION_LABEL_VALUE}\"" )
+$( [[ -n $encoded_spec && -n ${ROLLBACK_PVC_YAML_ANN:-} ]] && echo "  annotations:" )
+$( [[ -n $encoded_spec && -n ${ROLLBACK_PVC_YAML_ANN:-} ]] && echo "    ${ROLLBACK_PVC_YAML_ANN}: $encoded_spec" )
+$( [[ -n $pv_before && -n ${ROLLBACK_ORIG_PV_ANN:-} ]] && echo "    ${ROLLBACK_ORIG_PV_ANN}: $pv_before" )
+spec:
+  accessModes:
+  - ReadWriteOnce
+  volumeMode: $mode
+  storageClassName: ${sc}
+  resources:
+    requests:
+      storage: $size
+  dataSourceRef:
+    apiGroup: snapshot.storage.k8s.io
+    kind: VolumeSnapshot
+    name: $snapshot
+EOF
+  then
+    audit_add "PersistentVolume" "$destpvc" "" "create-failed" "N/A" "intermediate=true reason=applyFailure"
+    audit_add "PersistentVolumeClaim" "$destpvc" "$ns" "create-failed" "N/A" "inplace=$inplace sc=$sc reason=applyFailure"
+    return 1
+  else
+    audit_add "PersistentVolumeClaim" "$destpvc" "$ns" "create" "kubectl delete pvc $destpvc -n $ns" "sc=${sc} snapshot=${snapshot}"
+    if $inplace; then
+      # remove ROLLBACK_PVC_YAML_ANN annotation from pvc
+      kcmd annotate pvc "$destpvc" -n "$ns" "${ROLLBACK_PVC_YAML_ANN}-" --overwrite >/dev/null 2>&1 || true
+      kcmd annotate pvc "$destpvc" -n "$ns" "${ROLLBACK_ORIG_PV_ANN}-" --overwrite >/dev/null 2>&1 || true
+    fi
+  fi
+
+  if wait_pvc_bound "$ns" "$destpvc" "$BIND_TIMEOUT_SECONDS"; then
+    ok "PVC $ns/$destpvc bound"
+    audit_add "PersistentVolumeClaim" "$destpvc" "$ns" "bound" "kubectl describe pvc $destpvc -n $ns" "sc=${sc}"
+    return 0
+  fi
+
+  warn "PVC $ns/$destpvc not bound within timeout (${BIND_TIMEOUT_SECONDS}s)"
+  audit_add "PersistentVolumeClaim" "$destpvc" "$ns" "bind-timeout" "kubectl describe pvc $destpvc -n $ns" "sc=${sc} timeout=${BIND_TIMEOUT_SECONDS}s"
+  return 2
 }
 
 # ---------- RBAC Check ----------
@@ -366,6 +669,11 @@ migration_rbac_check() {
     "create volumesnapshotclasses.snapshot.storage.k8s.io"
     "get volumeattachments.storage.k8s.io"
   )
+
+  if [[ "$MODE" == "attrclass" ]]; then
+    cluster_checks+=("get volumeattributesclass")
+    cluster_checks+=("create volumeattributesclass")
+  fi
 
   if [[ -z "$NAMESPACE" ]]; then
     cluster_checks+=("list persistentvolumeclaims")
@@ -436,6 +744,17 @@ check_premium_lrs() {
   { [[ -z "$sku" || "$sku" == "Premium_LRS" ]] && [[ -z "$sat" || "$sat" == "Premium_LRS" ]]; }
 }
 
+check_premiumv2_lrs() {
+  local ns="$1" pvc="$2"
+  local val vac
+  vac="$(kcmd get pvc "$pvc" -n "$ns" -o jsonpath='{.spec.volumeAttributesClassName}' || true)"
+  if [[ ! -z "$vac" ]]; then
+    val="$(kcmd get volumeattributesclass.storage.k8s.io "$vac" -o jsonpath='{.parameters.skuName}')"
+    [[ "$val" == "PremiumV2_LRS" ]] && return 0
+  fi
+  return 1
+}
+
 # ---------- Snapshot Class & StorageClass Variant Helpers ----------
 ensure_snapshot_class() {
   if kcmd get volumesnapshotclass "$SNAPSHOT_CLASS" >/dev/null 2>&1; then
@@ -462,16 +781,46 @@ EOF
   fi
 }
 
+# -------- Mode-Specific Helpers --------
+ensure_volume_attributes_class() {
+  if kcmd get volumeattributesclass "${ATTR_CLASS_NAME}" >/dev/null 2>&1; then
+    if [[ "$ATTR_CLASS_FORCE_RECREATE" == "true" ]]; then
+      info "Recreating VolumeAttributesClass ${ATTR_CLASS_NAME}"
+      kcmd delete volumeattributesclass "${ATTR_CLASS_NAME}" --wait=true || true
+    else
+      info "VolumeAttributesClass ${ATTR_CLASS_NAME} present"
+      return 0
+    fi
+  fi
+  info "Creating VolumeAttributesClass ${ATTR_CLASS_NAME} (sku=${TARGET_SKU})"
+  if ! kapply_retry << EOF
+apiVersion: ${ATTR_CLASS_API_VERSION}
+kind: VolumeAttributesClass
+metadata:
+  name: ${ATTR_CLASS_NAME}
+  labels:
+    ${CREATED_BY_LABEL_KEY}: ${MIGRATION_TOOL_ID}
+driverName: disk.csi.azure.com
+parameters:
+  skuName: ${TARGET_SKU}
+EOF
+  then
+    audit_add "VolumeAttributesClass" "${ATTR_CLASS_NAME}" "" "create-failed" "N/A" "sku=${TARGET_SKU} reason=applyFailure"
+    exit 1
+  else
+    audit_add "VolumeAttributesClass" "${ATTR_CLASS_NAME}" "" "create" "kubectl delete volumeattributesclass ${ATTR_CLASS_NAME}" "sku=${TARGET_SKU}"
+  fi
+}
+
 apply_storage_class_variant() {
-  local base="$1" suffix="$2" sku="$3"
-  local sc_name="${base}-${suffix}"
+  local orig_name="$1" sc_name="$2" sku="$3"
   if kcmd get sc "$sc_name" >/dev/null 2>&1; then
     info "StorageClass $sc_name exists"
     return
   fi
-  local params_json params_filtered
-  params_json=$(kcmd get sc "$base" -o json 2>/dev/null || true)
-  [[ -z "$params_json" ]] && { warn "Cannot fetch base SC $base; skipping variant"; return; }
+  local params_json params_filtered allowed_topologies
+  params_json=$(kcmd get sc "$orig_name" -o json 2>/dev/null || true)
+  [[ -z "$params_json" ]] && { warn "Cannot fetch base SC $orig_name; skipping variant"; return; }
   params_filtered=$(echo "$params_json" | jq -r '
       .parameters
       | to_entries
@@ -482,6 +831,26 @@ apply_storage_class_variant() {
       | map("  " + .key + ": \"" + (.value|tostring) + "\"")
       | join("\n")
     ')
+  
+  # Extract allowedTopologies if present
+  allowed_topologies_yaml=$(echo "$params_json" | jq -r '
+      if .allowedTopologies then
+        "allowedTopologies:" +
+        (.allowedTopologies | 
+         map("\n- " + 
+             (.matchLabelExpressions // [] | 
+              if length > 0 then
+                "matchLabelExpressions:" +
+                (map("\n  - key: " + .key + "\n    values: [" + (.values | map("\"" + . + "\"") | join(", ")) + "]") | join(""))
+              else ""
+              end
+             )
+         ) | join(""))
+      else
+        ""
+      end
+    ')
+  
   info "Creating StorageClass $sc_name (skuName=$sku)"
   if ! kapply_retry <<EOF
 apiVersion: storage.k8s.io/v1
@@ -498,11 +867,13 @@ $params_filtered
 reclaimPolicy: Retain
 allowVolumeExpansion: true
 volumeBindingMode: Immediate
+$allowed_topologies_yaml
 EOF
   then
-    audit_add "StorageClass" "$sc_name" "" "create-failed" "N/A" "variantOf=${base} sku=${sku} reason=applyFailure"
+    audit_add "StorageClass" "$sc_name" "" "create-failed" "N/A" "variantOf=${orig_name} sku=${sku} reason=applyFailure"
+    return 1
   else
-    audit_add "StorageClass" "$sc_name" "" "create" "kubectl delete sc $sc_name" "variantOf=${base} sku=${sku}"
+    audit_add "StorageClass" "$sc_name" "" "create" "kubectl delete sc $sc_name" "variantOf=${orig_name} sku=${sku}"
   fi
 }
 
@@ -518,8 +889,10 @@ create_variants_for_sources() {
         continue
       fi
     fi
-    apply_storage_class_variant "$sc" "pv2" "PremiumV2_LRS"
-    apply_storage_class_variant "$sc" "pv1" "Premium_LRS"
+    pv2_sc=$(name_pv2_sc "$sc")
+    apply_storage_class_variant "$sc" "$pv2_sc" "PremiumV2_LRS"
+    pv1_sc=$(name_pv1_sc "$sc")
+    apply_storage_class_variant "$sc" "$pv1_sc" "Premium_LRS"
   done
 }
 
@@ -553,6 +926,12 @@ wait_for_workload_detach() {
     info "Scale down workloads then retrying in ${poll}s..."
     if (( timeout_deadline > 0 )) && (( $(date +%s) >= timeout_deadline )); then
       warn "Detach wait timeout for $ns/$pvc"
+      if [[ "$EXIT_ON_WORKLOAD_DETACH_TIMEOUT" == "true" ]]; then
+        err "Exiting due to detach wait timeout."
+        exit 1
+      else
+        warn "Continuing despite detach wait timeout."
+      fi
       return 1
     fi
     sleep "$poll"
@@ -621,7 +1000,7 @@ populate_pvcs() {
   printf '  %s\n' "${MIG_PVCS[@]}"
 }
 
-create_pv2_unique_storage_classes() {
+create_unique_storage_classes() {
   for entry in "${MIG_PVCS[@]}"; do
     ns="${entry%%|*}" pvc="${entry##*|}"
     sc=$(kcmd get pvc "$pvc" -n "$ns" -o jsonpath='{.spec.storageClassName}' 2>/dev/null || true)
@@ -630,6 +1009,58 @@ create_pv2_unique_storage_classes() {
   SOURCE_SCS=("${!SC_SET[@]}")
   info "Source StorageClasses: ${SOURCE_SCS[*]}"
   create_variants_for_sources "${SOURCE_SCS[@]}"
+}
+
+# -------- AttrClass Feature Gate Confirmation (additional pre-req) --------
+attrclass_feature_gate_confirm() {
+  [[ "$MODE" != "attrclass" ]] && return 0
+
+  # Skip entirely if user explicitly wants to skip the question (they may manage this externally)
+  if [[ "${ATTRCLASS_SKIP_FEATURE_GATE_PROMPT:-false}" == "true" ]]; then
+    info "Skipping VolumeAttributesClass feature-gate prompt (ATTRCLASS_SKIP_FEATURE_GATE_PROMPT=true)."
+    return 0
+  fi
+
+  # Auto-accept path for CI / automation
+  if [[ "${ATTRCLASS_ASSUME_FEATURE_GATES_YES:-false}" == "true" ]]; then
+    info "Assuming VolumeAttributesClass feature gates & runtime-config are enabled (ATTRCLASS_ASSUME_FEATURE_GATES_YES=true)."
+    return 0
+  fi
+
+  local ref_url="https://github.com/kubernetes-sigs/azuredisk-csi-driver/blob/master/deploy/example/modifyvolume/README.md"
+  local prompt_msg
+  prompt_msg=$'\nThe AttrClass migration mode requires that ALL of the following are already in place:\n\n'
+  prompt_msg+=$'- kube-apiserver started with feature gate:   --feature-gates=...,VolumeAttributesClass=true\n'
+  prompt_msg+=$'- kube-controller-manager feature gate:       --feature-gates=...,VolumeAttributesClass=true\n'
+  prompt_msg+=$'- external-provisioner (Azure Disk CSI) has:  --feature-gates=VolumeAttributesClass=true (if required by its version)\n'
+  prompt_msg+=$'- external-resizer (Azure Disk CSI) has:      --feature-gates=VolumeAttributesClass=true (if required)\n'
+  prompt_msg+=$'- API version ${ATTR_CLASS_API_VERSION} for VolumeAttributesClass is enabled (runtime-config if still beta), e.g.\n'
+  prompt_msg+=$'    --runtime-config=storage.k8s.io/v1beta1=true   (adjust if GA -> storage.k8s.io/v1)\n\n'
+  prompt_msg+=$'Confirm ALL of the above are configured cluster-wide? (y/N): '
+
+  local ans=""
+  # Try /dev/tty to remain interactive even if piped; fall back to stdin if tty not available
+  if [[ -t 0 ]]; then
+    read -r -p "$prompt_msg" ans
+  elif [[ -r /dev/tty ]]; then
+    read -r -p "$prompt_msg" ans < /dev/tty
+  else
+    warn "Non-interactive session; cannot prompt for VolumeAttributesClass feature gate confirmation."
+    PREREQ_ISSUES+=("VolumeAttributesClass feature gates / runtime-config not confirmed (non-interactive and no ATTRCLASS_ASSUME_FEATURE_GATES_YES)")
+    PREREQ_ISSUES+=("See reference (Prerequisites): $ref_url")
+    return 0
+  fi
+
+  case "${ans,,}" in
+    y|yes)
+      info "Feature gate & runtime-config confirmation accepted."
+      ;;
+    *)
+      err "User did NOT confirm required VolumeAttributesClass feature gates/runtime-config."
+      PREREQ_ISSUES+=("Missing or unconfirmed VolumeAttributesClass feature gates / runtime-config (apiserver/controller-manager/provisioner/resizer / apiVersion ${ATTR_CLASS_API_VERSION})")
+      PREREQ_ISSUES+=("Enable per (Prerequisites): $ref_url")
+      ;;
+  esac
 }
 
 run_prerequisites_checks() {
@@ -673,6 +1104,7 @@ run_prerequisites_checks() {
       [[ "$drv" != "disk.csi.azure.com" ]] && PREREQ_ISSUES+=("PV/$pv unknown provisioning type")
     fi
   done
+  attrclass_feature_gate_confirm
   info "NOTE: PremiumV2 quota not auto-checked."
 }
 
@@ -772,15 +1204,14 @@ EOF
     [[ "$ready" == "true" ]] && { ok "Snapshot $ns/$snap ready"; return 0; }
     sleep 5
   done
+  audit_add "VolumeSnapshot" "$snap" "$ns" "not-ready" "N/A" "sourcePVC=$source_pvc recreate=$recreated reason=timeout"
   warn "Snapshot $ns/$snap not ready after timeout"
   return 1
 }
 
 # --- Snapshot routines ---
 ensure_snapshot() {
-  local source_pvc="$1" ns="$2" pv="$3"
-  local snap
-  snap="$(name_snapshot "$pv")"
+  local snap=$1 source_pvc="$2" ns="$3" pv="$4"
   set +e
   ensure_volume_snapshot "$ns" "$source_pvc" "$snap"
   rc=$?
@@ -789,7 +1220,7 @@ ensure_snapshot() {
 }
 
 print_migration_cleanup_report() {
-  local mode="${MIGRATION_MODE:-dual}"
+  local mode="${MODE:-dual}"
   local success_header_printed=false
   local failed_header_printed=false
   local any=false
@@ -831,6 +1262,49 @@ print_migration_cleanup_report() {
         ] | @tsv
     ' 2>/dev/null || true)"
 
+  # For attrclass mode only:
+  # Identify original in-tree PVs (azureDisk) now phase=Available (claimRef cleared),
+  # that have a CSI twin PV (same diskURI) created by this tool (endswith -$MIG_SUFFIX, labeled created-by).
+  # Output columns (TSV):
+  #   origPV  origSC  origSize  diskURI  twinCsiPV  twinSC
+  local available_intree_lines=""
+  if [[ "$mode" == "attrclass" ]]; then
+    available_intree_lines="$(kcmd get pv -o json 2>/dev/null | jq -r \
+      --arg suf "-${MIG_SUFFIX}" \
+      --arg tool "${MIGRATION_TOOL_ID}" '
+        .items as $all
+        | [
+            .items[]
+            | select(
+                .status.phase=="Available"
+                and .spec.azureDisk.diskURI!=null
+              )
+            | . as $orig
+            | ($orig.spec.azureDisk.diskURI) as $disk
+            | (
+                $all[]
+                | select(
+                    .spec.csi!=null
+                    and .spec.csi.volumeHandle==$disk
+                    and (.metadata.labels["disk.csi.azure.com/created-by"]==$tool)
+                    and (.metadata.name|endswith($suf))
+                  )
+              ) as $csi
+            | select($csi!=null)
+            | [
+                $orig.metadata.name,
+                ($orig.spec.storageClassName // ""),
+                ($orig.spec.capacity.storage // ""),
+                $disk,
+                $csi.metadata.name,
+                ($csi.spec.storageClassName // ""),
+                ($orig.spec.persistentVolumeReclaimPolicy // "")
+              ] | @tsv
+          ]
+          | .[]
+      ' 2>/dev/null || true)"
+  fi
+
   for ENTRY in "${MIG_PVCS[@]}"; do
     local ns="${ENTRY%%|*}" pvc="${ENTRY##*|}"
     local done lbl pv
@@ -843,6 +1317,10 @@ print_migration_cleanup_report() {
       snap="$(name_snapshot "$pv")"
       int_pv="$(name_csi_pv "$pv")"
     fi
+    if [[ "$mode" == "inplace" || "$mode" == "attrclass" ]]; then
+      # get from dataSourceRef.name from spec of PVC
+      snap="$(kcmd get pvc "$pvc" -n "$ns" -o jsonpath='{.spec.dataSourceRef.name}' 2>/dev/null || true)"
+    fi
     int_pvc="$(name_csi_pvc "$pvc")"
     pv2_pvc="$(name_pv2_pvc "$pvc")"
 
@@ -854,9 +1332,9 @@ print_migration_cleanup_report() {
         success_header_printed=true
       }
       any=true
-      echo "  Source PVC: $ns/$pvc"
 
       if [[ "$mode" == "dual" ]]; then
+        echo "  Source PVC: $ns/$pvc"
         if kcmd get pvc "$int_pvc" -n "$ns" >/dev/null 2>&1 && \
            kcmd get pvc "$int_pvc" -n "$ns" -o json | jq -e --arg k "$CREATED_BY_LABEL_KEY" --arg v "$MIGRATION_TOOL_ID" '.metadata.labels[$k]==$v' >/dev/null; then
           echo "    - delete intermediate PVC: kubectl delete pvc $int_pvc -n $ns"
@@ -868,6 +1346,12 @@ print_migration_cleanup_report() {
         if kcmd get pvc "$pv2_pvc" -n "$ns" >/dev/null 2>&1 && \
            kcmd get pvc "$pv2_pvc" -n "$ns" -o json | jq -e --arg k "$CREATED_BY_LABEL_KEY" --arg v "$MIGRATION_TOOL_ID" '.metadata.labels[$k]==$v' >/dev/null; then
           echo "    - (optional) pv2 PVC present: $pv2_pvc (KEEP unless decommissioning)"
+        fi
+      else
+        if kcmd get pvc "$int_pvc" -n "$ns" >/dev/null 2>&1 && \
+           kcmd get pvc "$int_pvc" -n "$ns" -o json | jq -e --arg k "$CREATED_BY_LABEL_KEY" --arg v "$MIGRATION_TOOL_ID" '.metadata.labels[$k]==$v' >/dev/null; then
+          echo "  Source PVC: $ns/$pvc"
+          echo "    - delete intermediate PVC: kubectl delete pvc $int_pvc -n $ns"
         fi
       fi
       if [[ -n "$snap" ]] && kcmd get volumesnapshot "$snap" -n "$ns" >/dev/null 2>&1 && \
@@ -905,20 +1389,34 @@ print_migration_cleanup_report() {
       echo "    - retry guidance: leave artifacts intact; script will reuse them."
     fi
 
-    # PremiumV2 Released PVs referencing this claim (likely leftover pv2 PVs post-rollback usually in inplace mode)
+    # PremiumV2 Released PVs referencing this claim (leftover pv2 PVs)
     if [[ -n "$released_pv_lines" ]]; then
       local had_rel=false
       while IFS=$'\t' read -r rns rpvc rpv rreclaim rsc rcap rsku; do
         [[ -z "$rns" ]] && continue
         if [[ "$rns" == "$ns" && "$rpvc" == "$pvc" && "$rpv" != "$pv" ]]; then
           $had_rel || { echo "    - released PremiumV2 PV(s) associated (not currently) with claim:"; had_rel=true; }
-            echo "        * $rpv (sku=$rsku reclaim=${rreclaim:-?} sc=${rsc:-?} size=${rcap:-?})"
-            echo "            inspect: kubectl describe pv $rpv"
-            echo "            delete : kubectl delete pv $rpv   # after verifying data & rollback success"
+          echo "        * $rpv (sku=$rsku reclaim=${rreclaim:-?} sc=${rsc:-?} size=${rcap:-?})"
+          echo "            inspect: kubectl describe pv $rpv"
+          echo "            delete : kubectl delete pv $rpv   # after verifying data & rollback success"
         fi
       done <<< "$released_pv_lines"
     fi
   done
+
+  # AttrClass extra: list original in-tree PVs now Available with CSI twin
+  if [[ "$mode" == "attrclass" && -n "$available_intree_lines" ]]; then
+    echo
+    ok "Original in-tree PVs (phase=Available) with CSI replacement present"
+    echo "  (These are the original in-tree PVs; after verifying successful migration & no rollback need, you may delete them.)"
+    while IFS=$'\t' read -r origPV origSC origSize diskURI twinPV twinSC origRECLAIM; do
+      [[ -z "$origPV" ]] && continue
+      echo "    - $origPV (sc=${origSC:-?} size=${origSize:-?}) diskURI=$diskURI"
+      echo "        twin CSI PV: $twinPV (sc=${twinSC:-?})"
+      echo "        inspect (Reclaim: $origRECLAIM) : kubectl describe pv $origPV"
+      echo "        delete : kubectl delete pv $origPV   # non-destructive if reclaimPolicy=Retain"
+    done <<< "$available_intree_lines"
+  fi
 
   if [[ "$any" == "false" ]]; then
     info "No PVC entries to report."

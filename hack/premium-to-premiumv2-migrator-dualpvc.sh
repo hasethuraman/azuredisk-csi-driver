@@ -13,12 +13,22 @@ declare -a CONFLICT_ISSUES
 declare -A SC_SET
 declare -a PV2_CREATE_FAILURES
 declare -a PV2_BIND_TIMEOUTS
+declare -a NON_DETACHED_PVCS          # PVCs we skipped because workloads still attached
+declare -A NON_DETACHED_SET           # Fast membership check: key = "ns|pvc"
 
 MIG_PVCS=()
 PREREQ_ISSUES=()
 CONFLICT_ISSUES=()
 PV2_CREATE_FAILURES=()
 PV2_BIND_TIMEOUTS=()
+NON_DETACHED_PVCS=()
+NON_DETACHED_SET=()
+
+cleanup_on_error() {
+  finalize_audit_summary "$SCRIPT_START_TS" "$SCRIPT_START_EPOCH" || true
+  err "Script failed (exit=$rc); cleanup_on_error ran."
+}
+trap 'rc=$?; if [ $rc -ne 0 ]; then cleanup_on_error $rc; fi' EXIT
 
 # (after array zeroing, before ensure_no_foreign_conflicts)
 safe_array_len() {
@@ -32,7 +42,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "${SCRIPT_DIR}/lib-premiumv2-migration-common.sh"
 
 # Run RBAC preflight (mode=dual)
-MIGRATION_MODE=dual migration_rbac_check || { err "Aborting due to insufficient permissions."; exit 1; }
+MODE=$MODE migration_rbac_check || { err "Aborting due to insufficient permissions."; exit 1; }
 
 info "Migration label: $MIGRATION_LABEL"
 info "Target snapshot class: $SNAPSHOT_CLASS"
@@ -100,56 +110,6 @@ ensure_no_foreign_conflicts() {
   ok "No conflicting pre-existing objects detected."
 }
 
-ensure_pv2_pvc() {
-  local pvc="$1" ns="$2" pv="$3" size="$4" mode="$5" sc="$6"
-  local pv2_pvc snapshot
-  pv2_pvc="$(name_pv2_pvc "$pvc")"
-  snapshot="$(name_snapshot "$pv")"
-  if kcmd get pvc "$pv2_pvc" -n "$ns" >/dev/null 2>&1; then
-    info "PV2 PVC $ns/$pv2_pvc exists"
-    return
-  fi
-  info "Creating PV2 PVC $ns/$pv2_pvc"
-  if ! kapply_retry <<EOF
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: $pv2_pvc
-  namespace: $ns
-  labels:
-    ${CREATED_BY_LABEL_KEY}: ${MIGRATION_TOOL_ID}
-    ${MIGRATION_LABEL_KEY}: "${MIGRATION_LABEL_VALUE}"
-spec:
-  accessModes:
-  - ReadWriteOnce
-  volumeMode: $mode
-  storageClassName: ${sc}-pv2
-  resources:
-    requests:
-      storage: $size
-  dataSource:
-    apiGroup: snapshot.storage.k8s.io
-    kind: VolumeSnapshot
-    name: $snapshot
-EOF
-  then
-    audit_add "PersistentVolumeClaim" "$pv2_pvc" "$ns" "create-failed" "N/A" "pv2=true sc=${sc}-pv2 snapshot=${snapshot} reason=applyFailure"
-    return 1
-  else
-    audit_add "PersistentVolumeClaim" "$pv2_pvc" "$ns" "create" "kubectl delete pvc $pv2_pvc -n $ns" "pv2=true sc=${sc}-pv2 snapshot=${snapshot}"
-  fi
-
-  if wait_pvc_bound "$ns" "$pv2_pvc" "$BIND_TIMEOUT_SECONDS"; then
-    ok "PVC $ns/$pv2_pvc bound PremiumV2"
-    audit_add "PersistentVolumeClaim" "$pv2_pvc" "$ns" "bound" "kubectl describe pvc $pv2_pvc -n $ns" "pv2=true"
-    return 0
-  fi
-
-  warn "PVC $ns/$pv2_pvc not bound within timeout (${BIND_TIMEOUT_SECONDS}s)"
-  audit_add "PersistentVolumeClaim" "$pv2_pvc" "$ns" "bind-timeout" "kubectl describe pvc $pv2_pvc -n $ns" "pv2=true timeout=${BIND_TIMEOUT_SECONDS}s"
-  return 2
-}
-
 # ------------- Pre-Req & Conflicts -------------
 print_combined_validation_report_and_exit_if_needed() {
   local prereq_count
@@ -178,7 +138,7 @@ run_prerequisites_and_conflicts() {
 run_prerequisites_and_conflicts
 
 # ------------- Collect Unique Source SCs -------------
-create_pv2_unique_storage_classes
+create_unique_storage_classes
 
 # ------------- Main Migration Loop -------------
 for ENTRY in "${MIG_PVCS[@]}"; do
@@ -199,7 +159,12 @@ for ENTRY in "${MIG_PVCS[@]}"; do
   if [[ "$WAIT_FOR_WORKLOAD" == "true" ]]; then
     attachments=$(kcmd get volumeattachment -o jsonpath="{range .items[?(@.spec.source.persistentVolumeName=='$pv')]}{.metadata.name}{'\n'}{end}" 2>/dev/null || true)
     if [[ -n "$attachments" ]]; then
-      wait_for_workload_detach "$pv" "$pvc" "$pvc_ns" || { warn "Still attached -> skip $pvc_ns/$pvc"; continue; }
+      if ! wait_for_workload_detach "$pv" "$pvc" "$pvc_ns"; then
+        warn "Workload still attached -> deferring migration for $pvc_ns/$pvc (recording in NON_DETACHED_PVCS; no labels changed)."
+        NON_DETACHED_PVCS+=("${pvc_ns}|${pvc}")
+        NON_DETACHED_SET["${pvc_ns}|${pvc}"]=1
+        continue
+      fi
     fi
   fi
 
@@ -209,26 +174,25 @@ for ENTRY in "${MIG_PVCS[@]}"; do
   sc=$(kcmd get pv "$pv" -o jsonpath='{.spec.storageClassName}' 2>/dev/null || true)
   size=$(kcmd get pv "$pv" -o jsonpath='{.spec.capacity.storage}' 2>/dev/null || true)
   diskuri=$(kcmd get pv "$pv" -o jsonpath='{.spec.azureDisk.diskURI}' 2>/dev/null || true)
+  scpv2="$(name_pv2_sc "$sc")"
 
   csi_driver=$(kcmd get pv "$pv" -o jsonpath='{.spec.csi.driver}' 2>/dev/null || true)
   if [[ -n "$diskuri" ]]; then
     if [[ -z "$sc" || -z "$size" ]]; then warn "Missing sc/size for in-tree $pvc_ns/$pvc"; continue; fi
-    kcmd get sc "${sc}-pv1" >/dev/null 2>&1 || { warn "Missing ${sc}-pv1"; continue; }
-    kcmd get sc "${sc}-pv2" >/dev/null 2>&1 || { warn "Missing ${sc}-pv2"; continue; }
-    create_csi_pv_pvc "$pvc" "$pvc_ns" "$pv" "$size" "$mode" "$sc" "$diskuri"
+    scpv1="$(name_pv1_sc "$sc")"
+    create_csi_pv_pvc "$pvc" "$pvc_ns" "$pv" "$size" "$mode" "${scpv1}" "$diskuri"
     snapshot_source_pvc="$(name_csi_pvc "$pvc")"
   else
     [[ "$csi_driver" != "disk.csi.azure.com" ]] && { warn "Unknown PV driver for $pv"; continue; }
-    if [[ -z "$sc" || -z "$size" ]]; then warn "Missing sc/size for CSI $pvc_ns/$pvc"; continue; fi
-    kcmd get sc "${sc}-pv2" >/dev/null 2>&1 || { warn "Missing ${sc}-pv2"; continue; }
+    if [[ -z "$scpv2" || -z "$size" ]]; then warn "Missing sc/size for CSI $pvc_ns/$pvc"; continue; fi
+    kcmd get sc "${scpv2}" >/dev/null 2>&1 || { warn "Missing ${scpv2}"; continue; }
     snapshot_source_pvc="$pvc"
   fi
 
-  ensure_snapshot "$snapshot_source_pvc" "$pvc_ns" "$pv" || { \
-    warn "Snapshot failed $pvc_ns/$pvc"; \
-    audit_add "PersistentVolumeClaim" "$pvc" "$pvc_ns" "snapshot-failed" "kubectl describe pvc $pvc -n $pvc_ns" ""; \
-    continue; }
-  run_without_errexit ensure_pv2_pvc "$pvc" "$pvc_ns" "$pv" "$size" "$mode" "$sc"
+  pv2_pvc="$(name_pv2_pvc "$pvc")"
+  snapshot="$(name_snapshot "$pv")"
+  ensure_snapshot "$snapshot" "$snapshot_source_pvc" "$pvc_ns" "$pv" || { warn "Snapshot failed $pvc_ns/$pvc"; continue; }
+  run_without_errexit create_pvc_from_snapshot "$pvc" "$pvc_ns" "$pv" "$size" "$mode" "$scpv2" "$pv2_pvc" "$snapshot"
   rc=$?
   case "$rc" in
     0) ;; # success
@@ -238,16 +202,25 @@ for ENTRY in "${MIG_PVCS[@]}"; do
 done
 
 # ------------- Monitoring Loop -------------
-deadline=$(( $(date +%s) + MONITOR_TIMEOUT_MINUTES * 60 ))
+deadline=$(( $(date +%s) + MONITOR_TIMEOUT_MINUTES*60 ))
 info "Monitoring migrations (timeout ${MONITOR_TIMEOUT_MINUTES}m)..."
+monitor_start_epoch=$(date +%s)
 
 while true; do
   ALL_DONE=true
   for ENTRY in "${MIG_PVCS[@]}"; do
     pvc_ns="${ENTRY%%|*}" pvc="${ENTRY##*|}" pv2_pvc="$(name_pv2_pvc "$pvc")"
-    if kcmd get pvc "$pvc" -n "$pvc_ns" -o go-template="{{ index .metadata.labels \"${MIGRATION_DONE_LABEL_KEY}\" }}" | grep -q "^${MIGRATION_DONE_LABEL_VALUE}\$"; then
+
+    # Skip monitoring entirely for PVCs we never started due to attachment
+    if [[ ${NON_DETACHED_SET["${pvc_ns}|${pvc}"]+x} ]]; then
       continue
     fi
+
+    lbl=$(kcmd get pvc "$pvc" -n "$pvc_ns" -o go-template="{{ index .metadata.labels \"${MIGRATION_DONE_LABEL_KEY}\" }}" || true)
+    if [[ "$lbl" == "$MIGRATION_DONE_LABEL_VALUE" ]]; then
+      continue
+    fi
+
     STATUS=$(kcmd get pvc "$pv2_pvc" -n "$pvc_ns" -o jsonpath='{.status.phase}' 2>/dev/null || true)
     [[ "$STATUS" != "Bound" ]] && ALL_DONE=false
     reason=$(extract_event_reason "$pvc_ns" "$pv2_pvc")
@@ -255,6 +228,7 @@ while true; do
       SKUMigrationCompleted)
         mark_source_done "$pvc_ns" "$pvc"
         ok "Completed $pvc_ns/$pvc"
+        continue
         ;;
       SKUMigrationProgress|SKUMigrationStarted)
         info "$reason $pvc_ns/$pv2_pvc"; ALL_DONE=false ;;
@@ -289,6 +263,10 @@ while true; do
     warn "Monitor timeout reached."
     for ENTRY in "${MIG_PVCS[@]}"; do
       pvc_ns="${ENTRY%%|*}" pvc="${ENTRY##*|}"
+      # Ignore non-detached deferred PVCs
+      if [[ ${NON_DETACHED_SET["${pvc_ns}|${pvc}"]+x} ]]; then
+        continue
+      fi
       kcmd get pvc "$pvc" -n "$pvc_ns" -o go-template="{{ index .metadata.labels \"${MIGRATION_DONE_LABEL_KEY}\" }}" | \
         grep -q "^${MIGRATION_DONE_LABEL_VALUE}\$" && continue
       orig_pv=$(kcmd get pvc "$pvc" -n "$pvc_ns" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)
@@ -310,16 +288,6 @@ done
 # ------------- Summary & Audit -------------
 echo
 info "Summary:"
-for entry in "${MIG_PVCS[@]}"; do
-  ns="${entry%%|*}" pvc="${entry##*|}"
-  lbl=$(kcmd get pvc "$pvc" -n "$ns" -o go-template="{{ index .metadata.labels \"${MIGRATION_DONE_LABEL_KEY}\" }}" 2>/dev/null || true)
-  if [[ "$lbl" == "$MIGRATION_DONE_LABEL_VALUE" ]]; then
-    echo "  ✓ $ns/$pvc migrated"
-  else
-    echo "  • $ns/$pvc NOT completed"
-  fi
-done
-
 if (( ${#PV2_CREATE_FAILURES[@]} > 0 )); then
   echo
   warn "pv2 PVC creation failures (no resource or create error):"
@@ -331,6 +299,20 @@ if (( ${#PV2_BIND_TIMEOUTS[@]} > 0 )); then
   printf '  - %s\n' "${PV2_BIND_TIMEOUTS[@]}"
 fi
 
-MIGRATION_MODE=dual print_migration_cleanup_report
+for entry in "${MIG_PVCS[@]}"; do
+  ns="${entry%%|*}" pvc="${entry##*|}"
+  if [[ ${NON_DETACHED_SET["${ns}|${pvc}"]+x} ]]; then
+    echo "  - ${ns}/${pvc} deferred (workload still attached)"
+    continue
+  fi
+  lbl=$(kcmd get pvc "$pvc" -n "$ns" -o go-template="{{ index .metadata.labels \"${MIGRATION_DONE_LABEL_KEY}\" }}" 2>/dev/null || true)
+  if [[ "$lbl" == "$MIGRATION_DONE_LABEL_VALUE" ]]; then
+    echo "  ✓ $ns/$pvc migrated"
+  else
+    echo "  • $ns/$pvc NOT completed"
+  fi
+done
+
+MODE=$MODE print_migration_cleanup_report
 finalize_audit_summary "$SCRIPT_START_TS" "$SCRIPT_START_EPOCH"
 ok "Script finished."

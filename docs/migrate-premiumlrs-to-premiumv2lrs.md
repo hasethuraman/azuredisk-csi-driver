@@ -1,6 +1,6 @@
 # Premium_LRS → PremiumV2_LRS Migration Guide
 
-This guide explains how to use the migration scripts in `hack/` to move Azure Disk backed PVCs from Premium_LRS to PremiumV2_LRS. It covers the two supported modes (`inplace` and `dual`), prerequisites, validation steps, safety / rollback, cleanup, and troubleshooting.
+This guide explains how to use the migration scripts in `hack/` to move Azure Disk backed PVCs from Premium_LRS to PremiumV2_LRS. It now covers three supported modes (`inplace`, `dual`, and `attrclass` / VolumeAttributesClass), prerequisites, validation steps, safety / rollback, cleanup, and troubleshooting.
 
 ---
 
@@ -22,11 +22,39 @@ They are intended for controlled batches (not fire‑and‑forget across an enti
 |------|--------|---------|------|-------------------|-------------|
 | In-place | `hack/premium-to-premiumv2-migrator-inplace.sh` | Deletes original PVC (keeping original PV), recreates same name PVC pointing to snapshot and PremiumV2 SC | Same name preserved; minimal object sprawl | Short window where PVC is absent; workload must be quiesced/detached; rollback relies on retained PV | Smaller batches, controlled maintenance windows |
 | Dual (pv1→pv2) | `hack/premium-to-premiumv2-migrator-dualpvc.sh` | Creates intermediate CSI PV/PVC (if source was in-tree), snapshots, creates a *pv2* PVC (suffix), monitors migration events | Keeps original PVC around longer (reduced disruption); clearer staged artifacts | More objects (intermediate PV/PVC + target); higher cleanup burden; naming complexity | Migration where minimizing initial disruption matters or need visibility before switch |
+| AttrClass (in-place attribute update) | `hack/premium-to-premiumv2-migrator-vac.sh` | (Optionally) converts in-tree PV to CSI same-name first, then applies a `VolumeAttributesClass` to mutate the disk SKU | No new pv2 PVC; minimal object churn; preserves PVC name; avoids creating SC variants | Requires cluster & driver support for VolumeAttributesClass; rollback of SKU change requires another class or snapshot-based restore | Clusters already CSI-enabled or ready to convert; desire lowest object churn |
 
 Recommendation:
 1. Pilot on a tiny subset using `inplace` (simpler) in a non-prod namespace.
-2. If operational constraints demand minimal rename churn or extra observation time, use `dual` for broader rollout.
-3. Always label PVCs explicitly to opt them in (staged adoption).
+2. If you need prolonged coexistence / observation, use `dual`.
+3. If your cluster + Azure Disk CSI driver support `VolumeAttributesClass`, prefer `attrclass` for lowest object churn (especially when most PVs are already CSI).
+4. Always label PVCs explicitly to opt them in (staged adoption).
+
+### 2.1 AttrClass Mode Details
+
+`hack/premium-to-premiumv2-migrator-vac.sh`:
+- Ensures (or recreates if forced) a `VolumeAttributesClass` (default `azuredisk-premiumv2`) with `parameters.skuName=PremiumV2_LRS`.
+- For CSI Premium_LRS PVCs: patches `spec.volumeAttributesClassName` only (no new PVC/PV).
+- For in-tree azureDisk PVs: performs a one-time snapshot-based same-name CSI recreation (like a narrowed “inplace” convert) then patches attr class.
+- Central monitoring loop watches both:
+  - PV `.spec.csi.volumeAttributes.skuName|skuname` flip to `PremiumV2_LRS`.
+  - `SKUMigration*` events (if emitted) similar to other modes.
+- Rollback before SKU change: same as inplace (retained original PV + annotation / backup). After successful SKU mutation: must apply a different attr class pointing back to Premium_LRS (not auto-created) or restore from snapshot.
+
+Example:
+```bash
+kubectl label pvc data-app-a -n team-a disk.csi.azure.com/pv2migration=true
+cd hack
+./premium-to-premiumv2-migrator-vac.sh | tee run-attrclass-$(date +%Y%m%d-%H%M%S).log
+```
+
+Additional env (see section 5):
+```
+ATTR_CLASS_NAME=azuredisk-premiumv2
+ATTR_CLASS_API_VERSION=storage.k8s.io/v1beta1   # or storage.k8s.io/v1 when GA
+TARGET_SKU=PremiumV2_LRS
+ATTR_CLASS_FORCE_RECREATE=false
+```
 
 ---
 
@@ -82,6 +110,12 @@ Change the label (or add additional selectors externally) to control scope. Only
 | `MIGRATION_LABEL` | see above | PVC selection. |
 | `AUDIT_ENABLE` | `true` | Enable audit log lines. |
 | `AUDIT_LOG_FILE` | `pv1-pv2-migration-audit.log` | Rolling append log file. |
+| `ATTR_CLASS_NAME` | `azuredisk-premiumv2` | (AttrClass mode) Name of VolumeAttributesClass to apply. |
+| `ATTR_CLASS_API_VERSION` | `storage.k8s.io/v1beta1` | API version for VolumeAttributesClass (adjust if GA). |
+| `TARGET_SKU` | `PremiumV2_LRS` | Target skuName parameter for the VolumeAttributesClass. |
+| `ATTR_CLASS_FORCE_RECREATE` | `false` | Recreate the attr class each run. |
+| `PV_POLL_INTERVAL_SECONDS` | `10` | (AttrClass) Poll interval for sku check. |
+| `SKU_UPDATE_TIMEOUT_MINUTES` | `60` | (AttrClass optional blocking helper) Per-PVC sku update wait if used directly. |
 
 (See top of `lib-premiumv2-migration-common.sh` for the complete list.)
 
@@ -90,22 +124,74 @@ Change the label (or add additional selectors externally) to control scope. Only
 ## 6. Prerequisites & Validation Checklist
 
 Before running:
-1. RBAC: Ensure your principal can `get/list/create/patch/delete` PV/PVC/Snapshot/SC as required. Script will abort if critical verbs fail.
-2. Quota: Check PremiumV2 disk quotas in target subscription/region (script does NOT enforce).
-3. StorageClasses: Confirm original SC(s) are Premium_LRS (cachingMode=none, no unsupported encryption combos).
-4. Workload readiness: Plan for pods referencing target PVCs to be idle / safe to pause if using in-place.
-5. Snapshot CRDs: Ensure `VolumeSnapshot` CRDs installed (the script creates a class if absent).
-6. Label small test set:
+1. **RBAC**: Ensure your principal can `get/list/create/patch/delete` PV/PVC/Snapshot/SC as required. Script will abort if critical verbs fail.
+
+2. **Quota**: Check PremiumV2 disk quotas in target subscription/region (script does NOT enforce).
+
+3. **StorageClasses**: Confirm original SC(s) are Premium_LRS (cachingMode=none, no unsupported encryption combos).
+
+4. **⚠️ Zone Topology Requirements (Critical for PremiumV2_LRS)**: 
+   
+   **PremiumV2_LRS disks can only be attached to VMs running in the same Availability Zone.** If your workloads are zone-constrained or you're using topology-aware scheduling, you **must** update your source StorageClasses with `allowedTopologies` before migration.
+   
+   **Action Required**: Update your existing Premium_LRS StorageClasses to include the correct zone topology constraints:
+   
+   ```yaml
+   apiVersion: storage.k8s.io/v1
+   kind: StorageClass
+   metadata:
+     name: managed-premium  # Your existing StorageClass name
+   provisioner: disk.csi.azure.com
+   parameters:
+     skuName: Premium_LRS
+     cachingMode: None
+   allowedTopologies:
+     - matchLabelExpressions:
+         - key: topology.disk.csi.azure.com/zone
+           values:
+             - eastus2-1  # Replace with your target zone(s)
+             - eastus2-2  # Add multiple zones if needed
+             - eastus2-3
+   reclaimPolicy: Delete
+   allowVolumeExpansion: true
+   volumeBindingMode: WaitForFirstConsumer  # Recommended for zone-aware scheduling
    ```
+   
+   **How to determine your zones**:
+   ```bash
+   # Check zones where your nodes are running
+   kubectl get nodes -o custom-columns="NAME:.metadata.name,ZONE:.metadata.labels['topology\.kubernetes\.io/zone']"
+   
+   # Check zones where your existing PVs are located
+   kubectl get pv -o custom-columns="NAME:.metadata.name,ZONE:.spec.nodeAffinity.required.nodeSelectorTerms[0].matchExpressions[0].values[0]"
+   
+   # Check current PVC zones
+   kubectl get pvc -A -o custom-columns="NAMESPACE:.metadata.namespace,NAME:.metadata.name,ZONE:.metadata.annotations['volume\.kubernetes\.io/selected-node']" | grep -v '<none>'
+   ```
+   
+   **Why this matters**: 
+   - The migration script inherits `allowedTopologies` from your source StorageClass when creating PremiumV2_LRS variants
+   - Without proper topology constraints, PremiumV2 PVCs may be provisioned in zones where your workloads cannot access them
+   - This can result in pod scheduling failures or volume attachment timeouts
+
+5. **Workload readiness**: Plan for pods referencing target PVCs to be idle / safe to pause if using in-place.
+
+6. **Snapshot CRDs**: Ensure `VolumeSnapshot` CRDs installed (the script creates a class if absent).
+
+7. **Label small test set**:
+   ```bash
    kubectl label pvc data-app-a -n team-a disk.csi.azure.com/pv2migration=true
    ```
-7. Dry run *logic* (syntax & preflight only):
-   ```
+
+8. **Dry run *logic* (syntax & preflight only)**:
+   ```bash
    bash -n hack/premium-to-premiumv2-migrator-inplace.sh
    bash -n hack/premium-to-premiumv2-migrator-dualpvc.sh
    ```
-8. Optional: Run with a deliberately empty label selector to validate preflight (set `MIGRATION_LABEL="doesnotexist=true"` temporarily).
 
+9. **Optional**: Run with a deliberately empty label selector to validate preflight (set `MIGRATION_LABEL="doesnotexist=true"` temporarily).
+
+**Important**: After updating your source StorageClasses with topology constraints, verify that existing workloads can still schedule properly before proceeding with migration. The script will automatically inherit these topology settings when creating the PremiumV2_LRS variant StorageClasses.
 ---
 
 ## 7. Running the Scripts
@@ -125,6 +211,20 @@ Dual example:
 cd hack
 MAX_PVCS=5 MIG_SUFFIX=csi \
   ./premium-to-premiumv2-migrator-dualpvc.sh 2>&1 | tee run-dual-$(date +%Y%m%d-%H%M%S).log
+```
+
+AttrClass example:
+```bash
+cd hack
+MAX_PVCS=5 ATTR_CLASS_NAME=azuredisk-premiumv2 \
+  ./premium-to-premiumv2-migrator-vac.sh 2>&1 | tee run-attrclass-$(date +%Y%m%d-%H%M%S).log
+```
+
+AttrClass with in-tree presence (override baseline CSI SC):
+```bash
+cd hack
+CSI_BASELINE_SC=csi-azuredisk-premium \
+MAX_PVCS=3 ./premium-to-premiumv2-migrator-vac.sh
 ```
 
 Important runtime phases (both):
@@ -415,6 +515,9 @@ Summary:
 | No `SKUMigration*` events | Controller not emitting or watch delay | Force in-progress label (script auto after threshold) |
 | Released PV leftovers | Rollback or partial batch | Confirm not needed → delete PV |
 | Rollback failed to rebind | claimRef not cleared or PV reclaimPolicy=Delete | Ensure reclaimPolicy changed to Retain earlier |
+| AttrClass PVC never flips sku | Driver / cluster lacks VolumeAttributesClass update support | Confirm driver version & feature gate; inspect PV `.spec.csi.volumeAttributes` |
+| AttrClass run shows no events | Controller not emitting `SKUMigration*` | Rely on sku attribute polling; consider driver log inspection |
+| AttrClass rollback after sku change | SKU already mutated on disk | Apply alternate attr class (Premium_LRS) or snapshot restore |
 
 ---
 
@@ -441,6 +544,17 @@ MAX_PVCS=1 BIND_TIMEOUT_SECONDS=120 MONITOR_TIMEOUT_MINUTES=60 \
 # Verify migration:
 kubectl get pvc data-app-a -n team-a -o wide
 kubectl describe pv $(kubectl get pvc data-app-a -n team-a -o jsonpath='{.spec.volumeName}') | grep -i sku
+```
+
+### 15.1 Example AttrClass (CSI-native PVC)
+```bash
+kubectl label pvc data-app-b -n team-b disk.csi.azure.com/pv2migration=true
+cd hack
+./premium-to-premiumv2-migrator-vac.sh | tee mig-attrclass-b.log
+# Verify:
+kubectl get pvc data-app-b -n team-b -o wide
+pv=$(kubectl get pvc data-app-b -n team-b -o jsonpath='{.spec.volumeName}')
+kubectl get pv "$pv" -o jsonpath='{.spec.csi.volumeAttributes.skuName}'; echo
 ```
 
 ---
@@ -488,6 +602,11 @@ export BIND_TIMEOUT_SECONDS=120
 export WORKLOAD_DETACH_TIMEOUT_MINUTES=15
 export BACKUP_ORIGINAL_PVC=true
 export ROLLBACK_ON_TIMEOUT=true
+export ATTR_CLASS_NAME=azuredisk-premiumv2
+export TARGET_SKU=PremiumV2_LRS
+export ATTR_CLASS_FORCE_RECREATE=false
+export PV_POLL_INTERVAL_SECONDS=10
+export MIGRATION_FORCE_INPROGRESS_AFTER_MINUTES=10
 ```
 
 ---
@@ -498,10 +617,11 @@ export ROLLBACK_ON_TIMEOUT=true
 2. `bash -n` passes
 3. Run script → watch logs until summary
 4. Review cleanup report
-5. Verify data & app workload on PremiumV2
-6. Cleanup intermediate / snapshot artifacts as appropriate
-7. Archive audit + backups
-8. Proceed to next batch
+5. Verify data & app workload on PremiumV2 (PV attributes or events)
+6. (Dual/In-place) Cleanup intermediate / snapshot artifacts
+7. (AttrClass) Confirm attr class applied (PVC.spec.volumeAttributesClassName) & PV sku updated
+8. Archive audit + backups
+9. Proceed to next batch
 
 ---
 
