@@ -1,12 +1,13 @@
 # Premium_LRS → PremiumV2_LRS Migration Guide
 
-This guide explains how to use the migration scripts in `hack/` to move Azure Disk backed PVCs from Premium_LRS to PremiumV2_LRS. It now covers three supported modes (`inplace`, `dual`, and `attrclass` / VolumeAttributesClass), prerequisites, validation steps, safety / rollback, cleanup, and troubleshooting.
+This guide explains how to use the migration scripts in `hack/` to move Azure Disk backed PVCs from Premium_LRS to PremiumV2_LRS. It now covers three supported modes (`inplace`, `dual`, and `attrclass` / VolumeAttributesClass), zone-aware preparation, prerequisites, validation steps, safety / rollback, cleanup, and troubleshooting.
 
 ---
 
 ## 1. Goals & When to Use These Scripts
 
 These scripts automate:
+- Zone-aware preparation and StorageClass creation for PremiumV2_LRS requirements
 - Snapshotting existing Premium_LRS volumes
 - Creating PremiumV2_LRS replacement PVCs / PVs
 - (Optionally) staging intermediate CSI objects for in-tree disks
@@ -25,17 +26,18 @@ They are intended for controlled batches (not fire‑and‑forget across an enti
 | AttrClass (in-place attribute update) | `hack/premium-to-premiumv2-migrator-vac.sh` | (Optionally) converts in-tree PV to CSI same-name first, then applies a `VolumeAttributesClass` to mutate the disk SKU | No new pv2 PVC; minimal object churn; preserves PVC name; avoids creating SC variants | Requires cluster & driver support for VolumeAttributesClass; rollback of SKU change requires another class or snapshot-based restore | Clusters already CSI-enabled or ready to convert; desire lowest object churn |
 
 Recommendation:
-1. Pilot on a tiny subset using `inplace` (simpler) in a non-prod namespace.
-2. If you need prolonged coexistence / observation, use `dual`.
-3. If your cluster + Azure Disk CSI driver support `VolumeAttributesClass`, prefer `attrclass` for lowest object churn (especially when most PVs are already CSI).
-4. Always label PVCs explicitly to opt them in (staged adoption).
+1. **Always start with zone-aware preparation** (Step 4.1 below)
+2. Pilot on a tiny subset using `inplace` (simpler) in a non-prod namespace.
+3. If you need prolonged coexistence / observation, use `dual`.
+4. If your cluster + Azure Disk CSI driver support `VolumeAttributesClass`, prefer `attrclass` for lowest object churn (especially when most PVs are already CSI).
+5. Always label PVCs explicitly to opt them in (staged adoption).
 
 ### 2.1 AttrClass Mode Details
 
 `hack/premium-to-premiumv2-migrator-vac.sh`:
 - Ensures (or recreates if forced) a `VolumeAttributesClass` (default `azuredisk-premiumv2`) with `parameters.skuName=PremiumV2_LRS`.
 - For CSI Premium_LRS PVCs: patches `spec.volumeAttributesClassName` only (no new PVC/PV).
-- For in-tree azureDisk PVs: performs a one-time snapshot-based same-name CSI recreation (like a narrowed “inplace” convert) then patches attr class.
+- For in-tree azureDisk PVs: performs a one-time snapshot-based same-name CSI recreation (like a narrowed "inplace" convert) then patches attr class.
 - Central monitoring loop watches both:
   - PV `.spec.csi.volumeAttributes.skuName|skuname` flip to `PremiumV2_LRS`.
   - `SKUMigration*` events (if emitted) similar to other modes.
@@ -60,8 +62,10 @@ ATTR_CLASS_FORCE_RECREATE=false
 
 ## 3. Key Scripts & Shared Library
 
+- Zone-aware preparation: `hack/premium-to-premiumv2-zonal-aware-helper.sh`
 - In-place runner: `hack/premium-to-premiumv2-migrator-inplace.sh`
 - Dual runner: `hack/premium-to-premiumv2-migrator-dualpvc.sh`
+- AttrClass runner: `hack/premium-to-premiumv2-migrator-vac.sh`
 - Shared logic: `hack/lib-premiumv2-migration-common.sh`
 
 The common library provides:
@@ -75,7 +79,172 @@ The common library provides:
 
 ---
 
-## 4. Label-Driven Selection
+## 4. Zone-Aware Preparation (REQUIRED First Step)
+
+**⚠️ CRITICAL: Zone Preparation Must Be Run Before Migration**
+
+PremiumV2_LRS disks have strict zone requirements and must be provisioned in the same availability zone as the target workloads. The zone-aware preparation helper **must be run before any migration script** to ensure proper zone-specific StorageClass creation and PVC annotation.
+
+### 4.1 Zone-Aware Migration Helper Script
+
+**Script**: `hack/premium-to-premiumv2-zonal-aware-helper.sh`
+
+**Purpose**: 
+- Automatically detects zones for existing PVCs using multiple detection methods
+- Creates zone-specific StorageClasses with proper topology constraints  
+- Annotates PVCs with the appropriate zone-specific StorageClass for migration
+- Preserves all original StorageClass properties while adding zone constraints
+
+### 4.2 Zone Detection Logic (Automatic)
+
+The script uses a three-tier detection approach:
+
+1. **StorageClass allowedTopologies** - If single zone constraint exists, uses it
+2. **PV nodeAffinity** - Extracts zone from PV's node affinity requirements  
+3. **Zone mapping file** - Falls back to user-provided disk-to-zone mappings
+
+### 4.3 Usage
+
+#### Step 1: Generate Zone Mapping Template (if needed)
+```bash
+cd hack
+./premium-to-premiumv2-zonal-aware-helper.sh generate-template
+```
+
+This creates `disk-zone-mapping-template.txt` with entries for all PVCs marked for migration:
+```
+# Azure Disk Zone Mapping File
+# Format: <ArmId>=<zone>
+# Example zones: uksouth-1, uksouth-2, uksouth-3
+
+# PVC: default/my-app-data, PV: pv-abc123
+/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/myRG/providers/Microsoft.Compute/disks/myDisk1=uksouth-1
+```
+
+#### Step 2: Edit Zone Mapping (if automatic detection insufficient)
+```bash
+# Edit the generated file to specify correct zones
+vim disk-zone-mapping-template.txt
+
+# Rename to active mapping file  
+mv disk-zone-mapping-template.txt disk-zone-mapping.txt
+```
+
+#### Step 3: Run Zone Preparation
+```bash
+cd hack
+
+# Label PVCs for migration first
+kubectl label pvc data-app-a -n team-a disk.csi.azure.com/pv2migration=true
+kubectl label pvc data-app-b -n team-b disk.csi.azure.com/pv2migration=true
+
+# Run zone preparation (processes all labeled PVCs)
+./premium-to-premiumv2-zonal-aware-helper.sh process
+
+# Or with zone mapping file
+ZONE_MAPPING_FILE=disk-zone-mapping.txt ./premium-to-premiumv2-zonal-aware-helper.sh process
+
+# Process single PVC for testing
+./premium-to-premiumv2-zonal-aware-helper.sh process-single my-pvc my-namespace
+```
+
+### 4.4 What the Zone Helper Creates
+
+For each original StorageClass (e.g., `managed-premium`), the script creates zone-specific variants:
+
+```yaml
+# Example: managed-premium-uksouth-1
+apiVersion: storage.k8s.io/v1
+kind: StorageClass  
+metadata:
+  name: managed-premium-uksouth-1
+  labels:
+    disk.csi.azure.com/created-by: azuredisk-pv1-to-pv2-migrator
+  # All original labels preserved
+  # All original annotations preserved
+provisioner: disk.csi.azure.com
+parameters:
+  skuName: PremiumV2_LRS
+  cachingMode: None
+  # All compatible original parameters preserved
+reclaimPolicy: Retain                    # Preserved from original
+allowVolumeExpansion: true               # Preserved from original  
+volumeBindingMode: WaitForFirstConsumer  # Set for zone awareness
+allowedTopologies:
+  - matchLabelExpressions:
+      - key: topology.kubernetes.io/zone
+        values: ["uksouth-1"]             # Zone-specific constraint
+# Original mountOptions preserved if present
+```
+
+### 4.5 PVC Annotations Added
+
+The script annotates each processed PVC:
+```yaml
+metadata:
+  annotations:
+    disk.csi.azure.com/migration-sourcesc: "managed-premium-uksouth-1"
+```
+
+This annotation tells the migration scripts which zone-specific StorageClass to use instead of creating generic variants.
+
+### 4.6 Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ZONE_MAPPING_FILE` | `disk-zone-mapping.txt` | Path to disk-zone mapping file |
+| `MIGRATION_LABEL` | `disk.csi.azure.com/pv2migration=true` | PVC label selector (same as migration scripts) |
+| `NAMESPACE` | (empty) | Limit to specific namespace |
+| `MAX_PVCS` | `50` | Maximum PVCs to process in one run |
+| `ZONE_SC_ANNOTATION_KEY` | `disk.csi.azure.com/migration-sourcesc` | Annotation key for zone-specific StorageClass |
+
+### 4.7 Verification
+
+After running zone preparation, verify the results:
+
+```bash
+# Check created zone-specific StorageClasses
+kubectl get sc | grep "disk.csi.azure.com/created-by=azuredisk-pv1-to-pv2-migrator"
+
+# Check PVC annotations  
+kubectl get pvc -A -o custom-columns="NAMESPACE:.metadata.namespace,NAME:.metadata.name,ZONE-SC:.metadata.annotations.disk\.csi\.azure\.com/migration-sourcesc"
+
+# Verify zone topology in created StorageClasses
+kubectl get sc managed-premium-uksouth-1 -o yaml | grep -A 5 allowedTopologies
+```
+
+### 4.8 Error Handling & Skipping
+
+The script will:
+- **Skip** PVCs that already have the zone annotation (safe to re-run)
+- **Error** if zone cannot be determined from any detection method
+- **Warn** about PVCs without bound PVs or missing StorageClass
+- **Validate** that created StorageClasses match expected configuration
+
+### 4.9 Integration with Migration Scripts
+
+**IMPORTANT**: Run the zone preparation **before** any migration script:
+
+```bash
+# 1. FIRST: Label PVCs for migration
+kubectl label pvc data-app-a -n team-a disk.csi.azure.com/pv2migration=true
+
+# 2. SECOND: Run zone preparation  
+./premium-to-premiumv2-zonal-aware-helper.sh process
+
+# 3. THIRD: Run your chosen migration script
+./premium-to-premiumv2-migrator-inplace.sh
+# OR
+./premium-to-premiumv2-migrator-dualpvc.sh  
+# OR
+./premium-to-premiumv2-migrator-vac.sh
+```
+
+The migration scripts automatically detect and use the zone-specific StorageClass annotation, ensuring PremiumV2 volumes are provisioned in the correct zones.
+
+---
+
+## 5. Label-Driven Selection
 
 PVCs are selected by (default):
 ```
@@ -89,7 +258,7 @@ Change the label (or add additional selectors externally) to control scope. Only
 
 ---
 
-## 5. Environment Variables (Key Tunables)
+## 6. Environment Variables (Key Tunables)
 
 | Variable | Default | Meaning / Guidance |
 |----------|---------|--------------------|
@@ -97,10 +266,10 @@ Change the label (or add additional selectors externally) to control scope. Only
 | `MAX_PVCS` | `50` | Upper bound per run; script truncates beyond this to avoid huge batches. |
 | `MAX_PVC_CAPACITY_GIB` | `2048` | Skip PVCs at or above this (safety / PremiumV2 size comfort). |
 | `WAIT_FOR_WORKLOAD` | `true` | If true, tries to ensure detachment before migration (in-place more critical). |
-| `WORKLOAD_DETACH_TIMEOUT_MINUTES` | `0` | >0 to enforce a max wait for volume detach. |
+| `WORKLOAD_DETACH_TIMEOUT_MINUTES` | `5` | >0 to enforce a max wait for volume detach. |
 | `BIND_TIMEOUT_SECONDS` | `60` | Wait for new pv2 PVC binding. |
 | `MONITOR_TIMEOUT_MINUTES` | `300` | Global migration monitor upper bound. |
-| `MIGRATION_FORCE_INPROGRESS_AFTER_MINUTES` | `10` | Force a migration-inprogress label on original PV if events lag (in both modes). |
+| `MIGRATION_FORCE_INPROGRESS_AFTER_MINUTES` | `3` | Force a migration-inprogress label on original PV if events lag (in both modes). |
 | `BACKUP_ORIGINAL_PVC` | `true` | In-place only: store raw YAML (under `PVC_BACKUP_DIR`). |
 | `PVC_BACKUP_DIR` | `pvc-backups` | Backup directory root. |
 | `ROLLBACK_ON_TIMEOUT` | `true` (if set by you) | In-place: attempt rollback automatically on bind timeout / monitor timeout. |
@@ -116,89 +285,92 @@ Change the label (or add additional selectors externally) to control scope. Only
 | `ATTR_CLASS_FORCE_RECREATE` | `false` | Recreate the attr class each run. |
 | `PV_POLL_INTERVAL_SECONDS` | `10` | (AttrClass) Poll interval for sku check. |
 | `SKU_UPDATE_TIMEOUT_MINUTES` | `60` | (AttrClass optional blocking helper) Per-PVC sku update wait if used directly. |
+| `ONE_SC_FOR_MULTIPLE_ZONES` | `true` | When true, creates single StorageClass for multiple zones; when false, creates zone-specific StorageClasses. |
+| `ZONE_SC_ANNOTATION_KEY` | `disk.csi.azure.com/migration-sourcesc` | Annotation key for zone-specific StorageClass reference. |
 
 (See top of `lib-premiumv2-migration-common.sh` for the complete list.)
 
 ---
 
-## 6. Prerequisites & Validation Checklist
+## 7. Prerequisites & Validation Checklist (Updated)
 
-Before running:
-1. **RBAC**: Ensure your principal can `get/list/create/patch/delete` PV/PVC/Snapshot/SC as required. Script will abort if critical verbs fail.
+Before running migration scripts:
 
-2. **Quota**: Check PremiumV2 disk quotas in target subscription/region (script does NOT enforce).
+1. **⚠️ MANDATORY: Run Zone-Aware Preparation** (see Section 4)
+   - **MUST** be completed before any migration script
+   - Creates zone-specific StorageClasses with proper topology constraints
+   - Annotates PVCs with appropriate zone-specific StorageClass names
 
-3. **StorageClasses**: Confirm original SC(s) are Premium_LRS (cachingMode=none, no unsupported encryption combos).
+2. **RBAC**: Ensure your principal can `get/list/create/patch/delete` PV/PVC/Snapshot/SC as required. Script will abort if critical verbs fail.
 
-4. **⚠️ Zone Topology Requirements (Critical for PremiumV2_LRS)**: 
+3. **Quota**: Check PremiumV2 disk quotas in target subscription/region (script does NOT enforce).
+
+4. **StorageClasses**: Confirm original SC(s) are Premium_LRS (cachingMode=none, no unsupported encryption combos).
+
+5. **Zone Topology Verification**: 
    
-   **PremiumV2_LRS disks can only be attached to VMs running in the same Availability Zone.** If your workloads are zone-constrained or you're using topology-aware scheduling, you **must** update your source StorageClasses with `allowedTopologies` before migration.
+   After running the zone-aware helper (Section 4), verify that zone-specific StorageClasses were created correctly:
    
-   **Action Required**: Update your existing Premium_LRS StorageClasses to include the correct zone topology constraints:
-   
-   ```yaml
-   apiVersion: storage.k8s.io/v1
-   kind: StorageClass
-   metadata:
-     name: managed-premium  # Your existing StorageClass name
-   provisioner: disk.csi.azure.com
-   parameters:
-     skuName: Premium_LRS
-     cachingMode: None
-   allowedTopologies:
-     - matchLabelExpressions:
-         - key: topology.disk.csi.azure.com/zone
-           values:
-             - eastus2-1  # Replace with your target zone(s)
-             - eastus2-2  # Add multiple zones if needed
-             - eastus2-3
-   reclaimPolicy: Delete
-   allowVolumeExpansion: true
-   volumeBindingMode: WaitForFirstConsumer  # Recommended for zone-aware scheduling
-   ```
-   
-   **How to determine your zones**:
    ```bash
-   # Check zones where your nodes are running
-   kubectl get nodes -o custom-columns="NAME:.metadata.name,ZONE:.metadata.labels['topology\.kubernetes\.io/zone']"
+   # Check that zone-specific StorageClasses exist
+   kubectl get sc | grep "disk.csi.azure.com/created-by=azuredisk-pv1-to-pv2-migrator"
    
-   # Check zones where your existing PVs are located
-   kubectl get pv -o custom-columns="NAME:.metadata.name,ZONE:.spec.nodeAffinity.required.nodeSelectorTerms[0].matchExpressions[0].values[0]"
+   # Verify PVC annotations are in place
+   kubectl get pvc -A -o custom-columns="NAMESPACE:.metadata.namespace,NAME:.metadata.name,ZONE-SC:.metadata.annotations.disk\.csi\.azure\.com/migration-sourcesc"
    
-   # Check current PVC zones
-   kubectl get pvc -A -o custom-columns="NAMESPACE:.metadata.namespace,NAME:.metadata.name,ZONE:.metadata.annotations['volume\.kubernetes\.io/selected-node']" | grep -v '<none>'
+   # Confirm zone constraints in created StorageClasses
+   kubectl get sc <zone-specific-sc-name> -o yaml | grep -A 10 allowedTopologies
    ```
-   
-   **Why this matters**: 
-   - The migration script inherits `allowedTopologies` from your source StorageClass when creating PremiumV2_LRS variants
-   - Without proper topology constraints, PremiumV2 PVCs may be provisioned in zones where your workloads cannot access them
-   - This can result in pod scheduling failures or volume attachment timeouts
 
-5. **Workload readiness**: Plan for pods referencing target PVCs to be idle / safe to pause if using in-place.
+6. **Workload readiness**: Plan for pods referencing target PVCs to be idle / safe to pause if using in-place.
 
-6. **Snapshot CRDs**: Ensure `VolumeSnapshot` CRDs installed (the script creates a class if absent).
+7. **Snapshot CRDs**: Ensure `VolumeSnapshot` CRDs installed (the script creates a class if absent).
 
-7. **Label small test set**:
+8. **Label small test set**:
    ```bash
    kubectl label pvc data-app-a -n team-a disk.csi.azure.com/pv2migration=true
    ```
 
-8. **Dry run *logic* (syntax & preflight only)**:
+9. **Dry run *logic* (syntax & preflight only)**:
    ```bash
+   bash -n hack/premium-to-premiumv2-zonal-aware-helper.sh
    bash -n hack/premium-to-premiumv2-migrator-inplace.sh
    bash -n hack/premium-to-premiumv2-migrator-dualpvc.sh
+   bash -n hack/premium-to-premiumv2-migrator-vac.sh
    ```
 
-9. **Optional**: Run with a deliberately empty label selector to validate preflight (set `MIGRATION_LABEL="doesnotexist=true"` temporarily).
+10. **Optional**: Run with a deliberately empty label selector to validate preflight (set `MIGRATION_LABEL="doesnotexist=true"` temporarily).
 
-**Important**: After updating your source StorageClasses with topology constraints, verify that existing workloads can still schedule properly before proceeding with migration. The script will automatically inherit these topology settings when creating the PremiumV2_LRS variant StorageClasses.
+**Complete Workflow Order**:
+```bash
+# 1. Label PVCs for migration
+kubectl label pvc data-app-a -n team-a disk.csi.azure.com/pv2migration=true
+
+# 2. Run zone-aware preparation (MANDATORY FIRST)
+cd hack
+./premium-to-premiumv2-zonal-aware-helper.sh process
+
+# 3. Verify zone preparation results
+kubectl get pvc data-app-a -n team-a -o jsonpath='{.metadata.annotations.disk\.csi\.azure\.com/migration-sourcesc}'
+
+# 4. Run chosen migration script
+./premium-to-premiumv2-migrator-inplace.sh   # or dual/vac
+```
+
 ---
 
-## 7. Running the Scripts
+## 8. Running the Scripts
 
 Change to repository root or `hack/` directory.
 
-In-place example:
+**Zone preparation (MANDATORY FIRST STEP)**:
+```bash
+cd hack
+# Run zone preparation for all labeled PVCs
+./premium-to-premiumv2-zonal-aware-helper.sh process 2>&1 | tee zone-prep-$(date +%Y%m%d-%H%M%S).log
+```
+
+**In-place example**:
 ```bash
 cd hack
 # Limit to first few PVCs, raise verbosity by tee'ing output
@@ -206,40 +378,34 @@ MAX_PVCS=5 MIG_SUFFIX=csi \
   ./premium-to-premiumv2-migrator-inplace.sh 2>&1 | tee run-inplace-$(date +%Y%m%d-%H%M%S).log
 ```
 
-Dual example:
+**Dual example**:
 ```bash
 cd hack
 MAX_PVCS=5 MIG_SUFFIX=csi \
   ./premium-to-premiumv2-migrator-dualpvc.sh 2>&1 | tee run-dual-$(date +%Y%m%d-%H%M%S).log
 ```
 
-AttrClass example:
+**AttrClass example**:
 ```bash
 cd hack
 MAX_PVCS=5 ATTR_CLASS_NAME=azuredisk-premiumv2 \
   ./premium-to-premiumv2-migrator-vac.sh 2>&1 | tee run-attrclass-$(date +%Y%m%d-%H%M%S).log
 ```
 
-AttrClass with in-tree presence (override baseline CSI SC):
-```bash
-cd hack
-CSI_BASELINE_SC=csi-azuredisk-premium \
-MAX_PVCS=3 ./premium-to-premiumv2-migrator-vac.sh
-```
-
-Important runtime phases (both):
+Important runtime phases (all migration modes):
 1. Pre-req scan (size, SC parameters, binding).
 2. RBAC preflight.
-3. StorageClass variant creation (`<source>-pv1`, `<source>-pv2`).
-4. Snapshot creation or reuse.
-5. PVC/PV creation (intermediate for in-tree in dual; immediate replacement in inplace).
-6. Bind wait & event monitoring (`SKUMigrationStarted/Progress/Completed`).
-7. Labeling original PVC (`migration-done=true`) on completion.
-8. Summary + cleanup report + audit summary.
+3. Zone-aware StorageClass detection (looks for PVC annotations from zone helper).
+4. StorageClass variant creation (uses zone-specific SC if annotated, fallback to generic variants).
+5. Snapshot creation or reuse.
+6. PVC/PV creation (intermediate for in-tree in dual; immediate replacement in inplace).
+7. Bind wait & event monitoring (`SKUMigrationStarted/Progress/Completed`).
+8. Labeling original PVC (`migration-done=true`) on completion.
+9. Summary + cleanup report + audit summary.
 
 ---
 
-## 8. Rollback (In-place Mode)
+## 9. Rollback (In-place Mode)
 
 Each migrated PVC stores:
 - Base64 annotation with sanitized pre-migration spec (`rollback-pvc-yaml`)
@@ -348,7 +514,7 @@ If you also plan to retry the migration later:
 
 ---
 
-## 9. Interpreting Output
+## 10. Interpreting Output
 
 Key log prefixes:
 - `[OK]` – success milestones
@@ -518,6 +684,8 @@ Summary:
 | AttrClass PVC never flips sku | Driver / cluster lacks VolumeAttributesClass update support | Confirm driver version & feature gate; inspect PV `.spec.csi.volumeAttributes` |
 | AttrClass run shows no events | Controller not emitting `SKUMigration*` | Rely on sku attribute polling; consider driver log inspection |
 | AttrClass rollback after sku change | SKU already mutated on disk | Apply alternate attr class (Premium_LRS) or snapshot restore |
+| Zone preparation fails | Missing zone mapping or detection failure | Check zone mapping file, verify PV node affinity, use `generate-template` command |
+| Zone-specific SC not used | Missing zone annotation or incorrect annotation key | Verify PVC has `disk.csi.azure.com/migration-sourcesc` annotation |
 
 ---
 
@@ -535,8 +703,14 @@ Summary:
 # Label a target PVC
 kubectl label pvc data-app-a -n team-a disk.csi.azure.com/pv2migration=true
 
-# Run migration
+# Run zone preparation (MANDATORY FIRST)
 cd hack
+./premium-to-premiumv2-zonal-aware-helper.sh process
+
+# Verify zone preparation
+kubectl get pvc data-app-a -n team-a -o jsonpath='{.metadata.annotations.disk\.csi\.azure\.com/migration-sourcesc}'; echo
+
+# Run migration
 MAX_PVCS=1 BIND_TIMEOUT_SECONDS=120 MONITOR_TIMEOUT_MINUTES=60 \
   ./premium-to-premiumv2-migrator-inplace.sh | tee mig-inplace-a.log
 
@@ -549,8 +723,14 @@ kubectl describe pv $(kubectl get pvc data-app-a -n team-a -o jsonpath='{.spec.v
 ### 15.1 Example AttrClass (CSI-native PVC)
 ```bash
 kubectl label pvc data-app-b -n team-b disk.csi.azure.com/pv2migration=true
+
+# Run zone preparation first
 cd hack
+./premium-to-premiumv2-zonal-aware-helper.sh process
+
+# Run AttrClass migration
 ./premium-to-premiumv2-migrator-vac.sh | tee mig-attrclass-b.log
+
 # Verify:
 kubectl get pvc data-app-b -n team-b -o wide
 pv=$(kubectl get pvc data-app-b -n team-b -o jsonpath='{.spec.volumeName}')
@@ -606,7 +786,9 @@ export ATTR_CLASS_NAME=azuredisk-premiumv2
 export TARGET_SKU=PremiumV2_LRS
 export ATTR_CLASS_FORCE_RECREATE=false
 export PV_POLL_INTERVAL_SECONDS=10
-export MIGRATION_FORCE_INPROGRESS_AFTER_MINUTES=10
+export MIGRATION_FORCE_INPROGRESS_AFTER_MINUTES=3
+export ONE_SC_FOR_MULTIPLE_ZONES=true
+export ZONE_SC_ANNOTATION_KEY=disk.csi.azure.com/migration-sourcesc
 ```
 
 ---
@@ -615,13 +797,43 @@ export MIGRATION_FORCE_INPROGRESS_AFTER_MINUTES=10
 
 1. Label set? (Only intended PVCs show up)
 2. `bash -n` passes
-3. Run script → watch logs until summary
-4. Review cleanup report
-5. Verify data & app workload on PremiumV2 (PV attributes or events)
-6. (Dual/In-place) Cleanup intermediate / snapshot artifacts
-7. (AttrClass) Confirm attr class applied (PVC.spec.volumeAttributesClassName) & PV sku updated
-8. Archive audit + backups
-9. Proceed to next batch
+3. **Zone preparation complete?** (MANDATORY)
+4. Run script → watch logs until summary
+5. Review cleanup report
+6. Verify data & app workload on PremiumV2 (PV attributes or events)
+7. (Dual/In-place) Cleanup intermediate / snapshot artifacts
+8. (AttrClass) Confirm attr class applied (PVC.spec.volumeAttributesClassName) & PV sku updated
+9. Archive audit + backups
+10. Proceed to next batch
+
+---
+
+## 21. Zone-Aware Migration Complete Example
+
+```bash
+# Complete end-to-end example with zone-aware preparation
+
+# 1. Label target PVCs
+kubectl label pvc data-app-a -n team-a disk.csi.azure.com/pv2migration=true
+kubectl label pvc data-app-b -n team-b disk.csi.azure.com/pv2migration=true
+
+# 2. MANDATORY: Run zone-aware preparation
+cd hack
+./premium-to-premiumv2-zonal-aware-helper.sh process | tee zone-prep-$(date +%Y%m%d-%H%M%S).log
+
+# 3. Verify zone preparation results
+kubectl get pvc data-app-a -n team-a -o jsonpath='{.metadata.annotations.disk\.csi\.azure\.com/migration-sourcesc}'; echo
+kubectl get sc | grep "disk.csi.azure.com/created-by=azuredisk-pv1-to-pv2-migrator"
+
+# 4. Run migration with zone-aware StorageClasses
+MAX_PVCS=2 ./premium-to-premiumv2-migrator-inplace.sh | tee mig-inplace-zoneaware.log
+
+# 5. Verify PremiumV2 with correct zone constraints
+kubectl get pvc data-app-a -n team-a -o wide
+pv=$(kubectl get pvc data-app-a -n team-a -o jsonpath='{.spec.volumeName}')
+kubectl get pv "$pv" -o jsonpath='{.spec.csi.volumeAttributes.skuName}'; echo
+kubectl get sc $(kubectl get pvc data-app-a -n team-a -o jsonpath='{.spec.storageClassName}') -o yaml | grep -A 5 allowedTopologies
+```
 
 ---
 

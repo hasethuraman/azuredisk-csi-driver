@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# shellcheck source=./lib-premiumv2-migration-common.sh
+
 set -euo pipefail
 IFS=$'\n\t'
 
@@ -20,7 +22,6 @@ ROLLBACK_ON_TIMEOUT="${ROLLBACK_ON_TIMEOUT:-false}"
 declare -a MIG_PVCS
 declare -a PREREQ_ISSUES
 declare -a CONFLICT_ISSUES
-declare -A SC_SET
 declare -a NON_DETACHED_PVCS        # PVCs skipped because workload still attached
 declare -A NON_DETACHED_SET         # membership map ns|pvc -> 1
 PREREQ_ISSUES=()
@@ -30,8 +31,9 @@ NON_DETACHED_PVCS=()
 NON_DETACHED_SET=()
 
 cleanup_on_error() {
+  local exit_code="$1"
   finalize_audit_summary "$SCRIPT_START_TS" "$SCRIPT_START_EPOCH" || true
-  err "Script failed (exit=$rc); cleanup_on_error ran."
+  err "Script failed (exit=$exit_code); cleanup_on_error ran."
 }
 trap 'rc=$?; if [ $rc -ne 0 ]; then cleanup_on_error $rc; fi' EXIT
 
@@ -40,7 +42,7 @@ safe_array_len() {
   local name="$1"
   # If array not declared (future refactor), return 0 instead of tripping set -u
   declare -p "$name" &>/dev/null || { echo 0; return; }
-  eval "echo \${#$name[@]}"
+  eval "echo \${#${name}[@]}"
 }
 
 # -------- Shared Library --------
@@ -113,8 +115,10 @@ populate_pvcs
 
 # ---------------- Pre-Requisite Validation (mirrors dual script) ----------------
 print_combined_validation_report_and_exit_if_needed() {
-  local prereq_count=$(safe_array_len PREREQ_ISSUES)
-  local conflict_count=$(safe_array_len CONFLICT_ISSUES)
+  local prereq_count
+  prereq_count=$(safe_array_len PREREQ_ISSUES)
+  local conflict_count
+  conflict_count=$(safe_array_len CONFLICT_ISSUES)
   if (( prereq_count==0 && conflict_count==0 )); then
     ok "Pre-req & conflict checks passed."
     return
@@ -173,7 +177,8 @@ migrate_pvc_attrclass() {
 
   snapshot="$(name_snapshot "$pv")"
   ensure_snapshot "$snapshot" "$pvc" "$pvc_ns" "$pv" || {
-    warn "Snapshot failed $pvc_ns/$pvc"; continue;
+    warn "Snapshot failed $pvc_ns/$pvc"
+    return
   }
   ensure_reclaim_policy_retain "$pv"
   ensure_volume_attributes_class

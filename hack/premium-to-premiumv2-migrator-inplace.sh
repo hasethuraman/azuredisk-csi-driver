@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck source=./lib-premiumv2-migration-common.sh
 set -euo pipefail
 IFS=$'\n\t'
 
@@ -10,7 +11,6 @@ MODE=inplace
 declare -a MIG_PVCS
 declare -a PREREQ_ISSUES
 declare -a CONFLICT_ISSUES
-declare -A SC_SET
 declare -a ROLLBACK_FAILURES
 declare -a NON_DETACHED_PVCS        # PVCs skipped because workload still attached
 declare -A NON_DETACHED_SET         # membership map ns|pvc -> 1
@@ -35,7 +35,7 @@ safe_array_len() {
   local name="$1"
   declare -p "$name" &>/dev/null || { echo 0; return; }
   # indirect expansion
-  eval "echo \${#$name[@]}"
+  eval "echo \${#${name}[@]}"
 }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -87,8 +87,10 @@ populate_pvcs
 
 # ---------------- Pre-Requisite Validation (mirrors dual script) ----------------
 print_combined_validation_report_and_exit_if_needed() {
-  local prereq_count=$(safe_array_len PREREQ_ISSUES)
-  local conflict_count=$(safe_array_len CONFLICT_ISSUES)
+  local prereq_count
+  prereq_count=$(safe_array_len PREREQ_ISSUES)
+  local conflict_count
+  conflict_count=$(safe_array_len CONFLICT_ISSUES)
   if (( prereq_count==0 && conflict_count==0 )); then
     ok "Pre-req & conflict checks passed."
     return
@@ -203,7 +205,7 @@ for ENTRY in "${MIG_PVCS[@]}"; do
   ensure_reclaim_policy_retain "$pv"
 
   mode=$(kcmd get pv "$pv" -o jsonpath='{.spec.volumeMode}' 2>/dev/null || true)
-  sc=$(kcmd get pv "$pv" -o jsonpath='{.spec.storageClassName}' 2>/dev/null || true)
+  sc=$(get_sc_of_pvc "$pvc" "$pvc_ns")
   size=$(kcmd get pv "$pv" -o jsonpath='{.spec.capacity.storage}' 2>/dev/null || true)
   diskuri=$(kcmd get pv "$pv" -o jsonpath='{.spec.azureDisk.diskURI}' 2>/dev/null || true)
   scpv2="$(name_pv2_sc "$sc")"
@@ -225,18 +227,22 @@ for ENTRY in "${MIG_PVCS[@]}"; do
   snapshot="$(name_snapshot "$pv")"
   ensure_snapshot "$snapshot" "$snapshot_source_pvc" "$pvc_ns" "$pv" || { warn "Snapshot failed $pvc_ns/$pvc"; continue; }
   run_without_errexit create_pvc_from_snapshot "$pvc" "$pvc_ns" "$pv" "$size" "$mode" "$scpv2" "$pvc" "$snapshot"
-  rc=$?
+  rc=$LAST_RUN_WITHOUT_ERREXIT_RC
   if [[ $rc -eq 0 ]]; then
     ok "PV2 creation success $pvc_ns/$pvc"
     audit_add "PersistentVolumeClaim" "$pvc" "$pvc_ns" "migrated" "kubectl describe pvc $pvc -n $pvc_ns" "mode=inplace"
   elif [[ $rc -eq 2 ]]; then
     warn "Timeout $pvc_ns/$pvc"
     audit_add "PersistentVolumeClaim" "$pvc" "$pvc_ns" "migrate-timeout" "kubectl describe pvc $pvc -n $pvc_ns" "mode=inplace"
-    [[ "$ROLLBACK_ON_TIMEOUT" == "true" ]] && rollback_inplace "$pvc_ns" "$pvc" || true
+    if [[ "$ROLLBACK_ON_TIMEOUT" == "true" ]]; then
+      rollback_inplace "$pvc_ns" "$pvc" || true
+    fi
   else
     warn "Migration failure rc=$rc $pvc_ns/$pvc"
     audit_add "PersistentVolumeClaim" "$pvc" "$pvc_ns" "migrate-failed" "kubectl describe pvc $pvc -n $pvc_ns" "mode=inplace rc=$rc"
-    [[ "$ROLLBACK_ON_TIMEOUT" == "true" ]] && rollback_inplace "$pvc_ns" "$pvc" || true
+    if [[ "$ROLLBACK_ON_TIMEOUT" == "true" ]]; then
+      rollback_inplace "$pvc_ns" "$pvc" || true
+    fi
   fi
 done
 
