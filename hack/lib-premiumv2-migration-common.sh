@@ -10,6 +10,11 @@ warn() { echo "$(ts) [WARN] $*" >&2; }
 err()  { echo "$(ts) [ERROR] $*" >&2; }
 ok()   { echo "$(ts) [OK] $*"; }
 
+# ---------- Globals ----------
+declare -A SC_SET
+declare -g -A SC_CACHE
+declare -g -A PVC_SC_CACHE
+
 # ----------- Common configurations -----------
 MIG_SUFFIX="${MIG_SUFFIX:-csi}"
 AUDIT_ENABLE="${AUDIT_ENABLE:-true}"
@@ -23,6 +28,7 @@ MAX_PVCS="${MAX_PVCS:-50}"
 POLL_INTERVAL="${POLL_INTERVAL:-120}"
 WAIT_FOR_WORKLOAD="${WAIT_FOR_WORKLOAD:-true}"
 MIGRATION_FORCE_INPROGRESS_AFTER_MINUTES="${MIGRATION_FORCE_INPROGRESS_AFTER_MINUTES:-3}"
+ONE_SC_FOR_MULTIPLE_ZONES="${ONE_SC_FOR_MULTIPLE_ZONES:-true}"
 
 # In-place rollback keys
 ROLLBACK_PVC_YAML_ANN="${ROLLBACK_PVC_YAML_ANN:-disk.csi.azure.com/rollback-pvc-yaml}"
@@ -56,6 +62,9 @@ MIGRATION_DONE_LABEL_VALUE="${MIGRATION_DONE_LABEL_VALUE:-true}"
 MIGRATION_DONE_LABEL_VALUE_FALSE="${MIGRATION_DONE_LABEL_VALUE_FALSE:-false}"
 MIGRATION_INPROGRESS_LABEL_KEY="${MIGRATION_INPROGRESS_LABEL_KEY:-disk.csi.azure.com/migration-in-progress}"
 MIGRATION_INPROGRESS_LABEL_VALUE="${MIGRATION_INPROGRESS_LABEL_VALUE:-true}"
+ZONE_SC_ANNOTATION_KEY="${ZONE_SC_ANNOTATION_KEY:-disk.csi.azure.com/migration-sourcesc}"
+
+LAST_RUN_WITHOUT_ERREXIT_RC=0
 
 audit_add() {
   [[ "$AUDIT_ENABLE" != "true" ]] && return 0
@@ -182,8 +191,8 @@ name_csi_pvc() { local pvc="$1"; echo "${pvc}-${MIG_SUFFIX}"; }
 name_csi_pv()  { local pv="$1"; echo "${pv}-${MIG_SUFFIX}"; }
 name_snapshot(){ local pv="$1"; echo "ss-$(name_csi_pv "$pv")"; }
 name_pv2_pvc() { local pvc="$1"; echo "${pvc}-${MIG_SUFFIX}-pv2"; }
-name_pv1_sc()  { local sc="$1"; echo "${sc}-pv1"; }
-name_pv2_sc()  { local sc="$1"; echo "${sc}-pv2"; }
+name_pv1_sc()  { local sc="$1"; sc=$(get_srcsc_of_sc "$sc"); echo "${sc}-pv1"; }
+name_pv2_sc()  { local sc="$1"; sc=$(get_srcsc_of_sc "$sc"); echo "${sc}-pv2"; }
 
 # ---------- Utilities ----------
 require_bins() {
@@ -406,6 +415,47 @@ backup_pvc() {
     mv "$tmp_file" "$backup_file"
     audit_add "PersistentVolumeClaim" "$pvc" "$ns" "backup" "rm -f $backup_file" "dest=$backup_file size=$(wc -c <"$backup_file")B sc=${sc}"
   fi
+}
+
+get_srcsc_of_sc() {
+  local sci="$1"
+
+  # if one sc for multiple zones is false, return the original sc name
+  # else if one sc for multiple zones are used, use the zonal annotation based sc name
+  if [[ "$ONE_SC_FOR_MULTIPLE_ZONES" == "true" ]]; then
+    printf '%s' "$sci"
+    return 0
+  fi
+
+  if [[ -n ${SC_CACHE[$sci]:-} ]]; then
+    printf '%s' "${SC_CACHE[$sci]}"
+    return 0
+  fi
+
+  sc=$(kcmd get sc "$sci" -o jsonpath="{.metadata.annotations.${ZONE_SC_ANNOTATION_KEY//./\\.}}" 2>/dev/null || true)
+  if [[ -z $sc ]]; then
+    SC_CACHE["$sci"]="$sci"
+    printf '%s' "$sci"
+  else
+    SC_CACHE["$sci"]="$sc"
+    printf '%s' "$sc"
+  fi
+}
+
+get_sc_of_pvc() {
+  local pvc="$1" ns="$2"
+
+  if [[ -n ${PVC_SC_CACHE["$ns/$pvc"]:-} ]]; then
+    printf '%s' "${PVC_SC_CACHE["$ns/$pvc"]}"
+    return 0
+  fi
+
+  sc=$(kcmd get pvc "$pvc" -n "$ns" -o jsonpath="{.metadata.annotations.${ZONE_SC_ANNOTATION_KEY//./\\.}}" 2>/dev/null || true)
+  if [[ -z $sc ]]; then
+    sc=$(kcmd get pvc "$pvc" -n "$ns" -o jsonpath='{.spec.storageClassName}' 2>/dev/null || true)
+  fi
+  PVC_SC_CACHE["$ns/$pvc"]="$sc"
+  printf '%s' "$sc"
 }
 
 create_csi_pv_pvc() {
@@ -850,6 +900,30 @@ apply_storage_class_variant() {
         ""
       end
     ')
+
+    # Extract original labels (excluding system labels, add zone-specific ones)
+    orig_labels=$(echo "$params_json" | jq -r '
+        .metadata.labels // {}
+        | to_entries
+        | map(select(.key | test("^(kubernetes\\.io/|k8s\\.io/|pv\\.kubernetes\\.io/|volume\\.kubernetes\\.io/|app\\.kubernetes\\.io/managed-by|storageclass\\.kubernetes\\.io/is-default-class)") | not))
+        | map("    " + .key + ": \"" + (.value|tostring) + "\"")
+        | join("\n")
+    ')
+    
+    # Extract original annotations (excluding system annotations)
+    orig_annotations=$(echo "$params_json" | jq -r --arg zone_key "$ZONE_SC_ANNOTATION_KEY" '
+        .metadata.annotations // {}
+        | to_entries
+        | map(select(.key | test("^(kubernetes\\.io/|k8s\\.io/|pv\\.kubernetes\\.io/|volume\\.kubernetes\\.io/|kubectl\\.kubernetes\\.io/|deployment\\.kubernetes\\.io/|control-plane\\.|storageclass\\.kubernetes\\.io/is-default-class)") | not))
+        | map(select(.key != $zone_key))
+        | map("    " + .key + ": \"" + (.value|tostring|gsub("\\n"; "\\\\n")|gsub("\\\""; "\\\\\"")) + "\"")
+        | join("\n")
+    ')
+
+  if [[ -z "$allowed_topologies_yaml" ]]; then
+    err "Base StorageClass $orig_name has no allowedTopologies; skipping variant $sc_name"
+    return 1
+  fi
   
   info "Creating StorageClass $sc_name (skuName=$sku)"
   if ! kapply_retry <<EOF
@@ -859,6 +933,9 @@ metadata:
   name: $sc_name
   labels:
     ${CREATED_BY_LABEL_KEY}: ${MIGRATION_TOOL_ID}
+$(if [[ -n "$orig_labels" ]]; then echo "$orig_labels"; fi)
+$(if [[ -n "$orig_annotations" ]]; then echo "annotations:"; fi)
+$(if [[ -n "$orig_annotations" ]]; then echo "$orig_annotations"; fi)
 provisioner: disk.csi.azure.com
 parameters:
   skuName: $sku
@@ -1003,7 +1080,8 @@ populate_pvcs() {
 create_unique_storage_classes() {
   for entry in "${MIG_PVCS[@]}"; do
     ns="${entry%%|*}" pvc="${entry##*|}"
-    sc=$(kcmd get pvc "$pvc" -n "$ns" -o jsonpath='{.spec.storageClassName}' 2>/dev/null || true)
+    # if $pvc has ZONE_SC_ANNOTATION_KEY annotation, use it otherwise use .spec.storageClassName
+    sc=$(get_sc_of_pvc "$pvc" "$ns")
     [[ -n "$sc" ]] && SC_SET["$sc"]=1
   done
   SOURCE_SCS=("${!SC_SET[@]}")
@@ -1071,7 +1149,7 @@ run_prerequisites_checks() {
     local ns="${ENTRY%%|*}" pvc="${ENTRY##*|}" pv sc size zone sc_json
     pv=$(kcmd get pvc "$pvc" -n "$ns" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)
     [[ -z "$pv" ]] && { PREREQ_ISSUES+=("PVC/$ns/$pvc not bound"); continue; }
-    sc=$(kcmd get pvc "$pvc" -n "$ns" -o jsonpath='{.spec.storageClassName}' 2>/dev/null || true)
+    sc=$(get_sc_of_pvc "$pvc" "$ns")
     size=$(kcmd get pv "$pv" -o jsonpath='{.spec.capacity.storage}' 2>/dev/null || true)
     [[ -z "$sc" ]] && PREREQ_ISSUES+=("PVC/$ns/$pvc missing storageClassName")
     [[ -z "$size" ]] && PREREQ_ISSUES+=("PV/$pv capacity missing")
@@ -1427,15 +1505,15 @@ print_migration_cleanup_report() {
 }
 
 run_without_errexit() {
+    LAST_RUN_WITHOUT_ERREXIT_RC=0
     local errexit_was_set=false
     [[ $- == *e* ]] && errexit_was_set=true
 
     set +e
     "$@"
-    local rc=$?
 
+    LAST_RUN_WITHOUT_ERREXIT_RC=$?
     $errexit_was_set && set -e
-    return $rc
 }
 
 require_bins

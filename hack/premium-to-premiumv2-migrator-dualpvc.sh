@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck source=./lib-premiumv2-migration-common.sh
 set -euo pipefail
 IFS=$'\n\t'
 
@@ -10,7 +11,6 @@ MODE=dual
 declare -a MIG_PVCS
 declare -a PREREQ_ISSUES
 declare -a CONFLICT_ISSUES
-declare -A SC_SET
 declare -a PV2_CREATE_FAILURES
 declare -a PV2_BIND_TIMEOUTS
 declare -a NON_DETACHED_PVCS          # PVCs we skipped because workloads still attached
@@ -35,7 +35,7 @@ safe_array_len() {
   local name="$1"
   # If array not declared (future refactor), return 0 instead of tripping set -u
   declare -p "$name" &>/dev/null || { echo 0; return; }
-  eval "echo \${#$name[@]}"
+  eval "echo \${#${name}[@]}"
 }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -171,7 +171,7 @@ for ENTRY in "${MIG_PVCS[@]}"; do
   ensure_reclaim_policy_retain "$pv"
 
   mode=$(kcmd get pv "$pv" -o jsonpath='{.spec.volumeMode}' 2>/dev/null || true)
-  sc=$(kcmd get pv "$pv" -o jsonpath='{.spec.storageClassName}' 2>/dev/null || true)
+  sc=$(get_sc_of_pvc "$pvc" "$pvc_ns")
   size=$(kcmd get pv "$pv" -o jsonpath='{.spec.capacity.storage}' 2>/dev/null || true)
   diskuri=$(kcmd get pv "$pv" -o jsonpath='{.spec.azureDisk.diskURI}' 2>/dev/null || true)
   scpv2="$(name_pv2_sc "$sc")"
@@ -193,8 +193,7 @@ for ENTRY in "${MIG_PVCS[@]}"; do
   snapshot="$(name_snapshot "$pv")"
   ensure_snapshot "$snapshot" "$snapshot_source_pvc" "$pvc_ns" "$pv" || { warn "Snapshot failed $pvc_ns/$pvc"; continue; }
   run_without_errexit create_pvc_from_snapshot "$pvc" "$pvc_ns" "$pv" "$size" "$mode" "$scpv2" "$pv2_pvc" "$snapshot"
-  rc=$?
-  case "$rc" in
+  case "$LAST_RUN_WITHOUT_ERREXIT_RC" in
     0) ;; # success
     1) PV2_CREATE_FAILURES+=("${pvc_ns}/${pvc}") ;;
     2) PV2_BIND_TIMEOUTS+=("${pvc_ns}/${pvc}") ;;
@@ -204,7 +203,6 @@ done
 # ------------- Monitoring Loop -------------
 deadline=$(( $(date +%s) + MONITOR_TIMEOUT_MINUTES*60 ))
 info "Monitoring migrations (timeout ${MONITOR_TIMEOUT_MINUTES}m)..."
-monitor_start_epoch=$(date +%s)
 
 while true; do
   ALL_DONE=true
