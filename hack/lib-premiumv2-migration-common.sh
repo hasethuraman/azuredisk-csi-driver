@@ -14,6 +14,9 @@ ok()   { echo "$(ts) [OK] $*"; }
 declare -A SC_SET
 declare -g -A SC_CACHE
 declare -g -A PVC_SC_CACHE
+declare -g -A PVCS_MIGRATION_INPROGRESS_MARKED_CACHE
+declare -A _UNIQUE_ZONES=()
+declare -g -A SNAPSHOTS_ARRAY
 
 # ----------- Common configurations -----------
 MIG_SUFFIX="${MIG_SUFFIX:-csi}"
@@ -29,6 +32,7 @@ POLL_INTERVAL="${POLL_INTERVAL:-120}"
 WAIT_FOR_WORKLOAD="${WAIT_FOR_WORKLOAD:-true}"
 MIGRATION_FORCE_INPROGRESS_AFTER_MINUTES="${MIGRATION_FORCE_INPROGRESS_AFTER_MINUTES:-3}"
 ONE_SC_FOR_MULTIPLE_ZONES="${ONE_SC_FOR_MULTIPLE_ZONES:-true}"
+SINGLE_ZONE_USE_GENERIC_PV2_SC="${SINGLE_ZONE_USE_GENERIC_PV2_SC:-true}"
 
 # In-place rollback keys
 ROLLBACK_PVC_YAML_ANN="${ROLLBACK_PVC_YAML_ANN:-disk.csi.azure.com/rollback-pvc-yaml}"
@@ -64,7 +68,14 @@ MIGRATION_INPROGRESS_LABEL_KEY="${MIGRATION_INPROGRESS_LABEL_KEY:-disk.csi.azure
 MIGRATION_INPROGRESS_LABEL_VALUE="${MIGRATION_INPROGRESS_LABEL_VALUE:-true}"
 ZONE_SC_ANNOTATION_KEY="${ZONE_SC_ANNOTATION_KEY:-disk.csi.azure.com/migration-sourcesc}"
 
+# ------------ State ----------
 LAST_RUN_WITHOUT_ERREXIT_RC=0
+GENERIC_PV2_SC_MODE=0
+
+is_direct_exec() {
+    # realpath + -ef handles symlinks and differing relative paths
+    [[ "$(realpath "${BASH_SOURCE[0]}")" -ef "$(realpath "$0")" ]]
+}
 
 audit_add() {
   [[ "$AUDIT_ENABLE" != "true" ]] && return 0
@@ -268,20 +279,49 @@ ensure_reclaim_policy_retain() {
   fi
 }
 
+mark_source_in_progress() {
+  local pvc_ns="$1" pvc="$2"
+
+  if [[ -n ${PVCS_MIGRATION_INPROGRESS_MARKED_CACHE["$pvc_ns/$pvc"]:-} ]]; then
+    return 0
+  fi
+
+  kcmd label pvc "$pvc" -n "$pvc_ns" "${MIGRATION_INPROGRESS_LABEL_KEY}=${MIGRATION_INPROGRESS_LABEL_VALUE}" --overwrite >/dev/null
+  
+  if [[ $? -eq 0 ]]; then
+      PVCS_MIGRATION_INPROGRESS_MARKED_CACHE["$pvc_ns/$pvc"]=1
+  fi
+
+  audit_add "PersistentVolumeClaim" "$pvc" "$pvc_ns" "label" \
+    "kubectl label pvc $pvc -n $pvc_ns ${MIGRATION_INPROGRESS_LABEL_KEY}-" \
+    "in-progress=${MIGRATION_INPROGRESS_LABEL_VALUE}"
+
+}
+
 mark_source_done() {
   local pvc_ns="$1" pvc="$2"
-  kcmd label pvc "$pvc" -n "$pvc_ns" "${MIGRATION_DONE_LABEL_KEY}=${MIGRATION_DONE_LABEL_VALUE}" --overwrite
+  kcmd label pvc "$pvc" -n "$pvc_ns" "${MIGRATION_DONE_LABEL_KEY}=${MIGRATION_DONE_LABEL_VALUE}" --overwrite >/dev/null
   audit_add "PersistentVolumeClaim" "$pvc" "$pvc_ns" "label" \
     "kubectl label pvc $pvc -n $pvc_ns ${MIGRATION_DONE_LABEL_KEY}-" \
     "done=${MIGRATION_DONE_LABEL_VALUE}"
+
+  kcmd label pvc "$pvc" -n "$pvc_ns" "${MIGRATION_INPROGRESS_LABEL_KEY}-" --overwrite >/dev/null
+  audit_add "PersistentVolumeClaim" "$pvc" "$pvc_ns" "label-remove" \
+    "kubectl label pvc $pvc -n $pvc_ns ${MIGRATION_INPROGRESS_LABEL_KEY}-" \
+    "remove in-progress label"
 }
 
-remove_migration_done_label() {
+mark_source_notdone() {
   local pvc_ns="$1" pvc="$2"
-  kcmd label pvc "$pvc" -n "$pvc_ns" "${MIGRATION_DONE_LABEL_KEY}-" --overwrite
+  kcmd label pvc "$pvc" -n "$pvc_ns" "${MIGRATION_DONE_LABEL_KEY}=${MIGRATION_DONE_LABEL_VALUE_FALSE}" --overwrite >/dev/null
+  audit_add "PersistentVolumeClaim" "$pvc" "$pvc_ns" "label" \
+    "kubectl label pvc $pvc -n $pvc_ns ${MIGRATION_DONE_LABEL_KEY}-" \
+    "done=${MIGRATION_DONE_LABEL_VALUE_FALSE}"
+
+  kcmd label pvc "$pvc" -n "$pvc_ns" "${MIGRATION_INPROGRESS_LABEL_KEY}-" --overwrite >/dev/null
   audit_add "PersistentVolumeClaim" "$pvc" "$pvc_ns" "label-remove" \
-    "kubectl label pvc $pvc -n $pvc_ns ${MIGRATION_DONE_LABEL_KEY}=" \
-    "remove done label"
+    "kubectl label pvc $pvc -n $pvc_ns ${MIGRATION_INPROGRESS_LABEL_KEY}-" \
+    "remove in-progress label"
 }
 
 wait_pvc_bound() {
@@ -417,11 +457,31 @@ backup_pvc() {
   fi
 }
 
+is_pvc_created_by_migration_tool() {
+  local pvc="$1" ns="$2"
+  createdby=$(kcmd get pvc "$pvc" -n "$ns" -o go-template="{{ index .metadata.labels \"${CREATED_BY_LABEL_KEY}\" }}" 2>/dev/null || true)
+  if [[ $createdby == "$MIGRATION_TOOL_ID" ]]; then
+    echo "true"
+  else
+    echo "false"
+  fi
+}
+
+is_pvc_in_migration() {
+  local pvc="$1" ns="$2"
+  inprog=$(kcmd get pvc "$pvc" -n "$ns" -o go-template="{{ index .metadata.labels \"${MIGRATION_INPROGRESS_LABEL_KEY}\" }}" 2>/dev/null || true)
+  if [[ $inprog == "true" ]]; then
+    echo "true"
+  else
+    echo "false"
+  fi
+}
+
 get_srcsc_of_sc() {
   local sci="$1"
 
-  # if one sc for multiple zones is false, return the original sc name
-  # else if one sc for multiple zones are used, use the zonal annotation based sc name
+  # if one sc for multiple zones are used, use the incoming storage class which is intermediate based on zone
+  # else if one sc for multiple zones is false, return the sc name and not source sc [which means one storage class per zone & dont need naming in storage class]
   if [[ "$ONE_SC_FOR_MULTIPLE_ZONES" == "true" ]]; then
     printf '%s' "$sci"
     return 0
@@ -500,7 +560,7 @@ create_csi_pv_pvc() {
       audit_add "PersistentVolumeClaim" "$csi_pvc" "$ns" "delete" "N/A" "inplace=true reason=preexisting"
       return 1
     fi
-    audit_add "PersistentVolumeClaim" "$csi_pvc" "$ns" "delete" "N/A" "inplace=true reason=preexisting"
+    audit_add "PersistentVolumeClaim" "$csi_pvc" "$ns" "delete" "kubectl create -f <(echo \"$encoded_spec\" | base64 --decode) " "inplace=true reason=replace"
 
     if ! kcmd patch pv "$pv" -p '{"spec":{"claimRef":null}}' >/dev/null 2>&1; then
       warn "Clear claimRef failed for PV $pv"
@@ -637,7 +697,7 @@ create_pvc_from_snapshot() {
       audit_add "PersistentVolumeClaim" "$pvc" "$ns" "delete-failed" "N/A" "inplace=true reason=preexisting"
       return 1
     fi
-    audit_add "PersistentVolumeClaim" "$pvc" "$ns" "delete" "N/A" "inplace=true reason=preexisting"
+    audit_add "PersistentVolumeClaim" "$pvc" "$ns" "delete" "kubectl create -f <(echo \"$encoded_spec\" | base64 --decode) " "inplace=true reason=preexisting"
 
     if ! kcmd patch pv "$pv" -p '{"spec":{"claimRef":null}}' >/dev/null 2>&1; then
       warn "Clear claimRef failed for PV $pv"
@@ -678,12 +738,8 @@ EOF
     audit_add "PersistentVolumeClaim" "$destpvc" "$ns" "create-failed" "N/A" "inplace=$inplace sc=$sc reason=applyFailure"
     return 1
   else
+    audit_add "PersistentVolumeClaim" "$destpvc" "$ns" "create" "kubectl delete pvc $destpvc -n $ns" "inplace=$inplace sc=${sc} snapshot=${snapshot}"
     audit_add "PersistentVolumeClaim" "$destpvc" "$ns" "create" "kubectl delete pvc $destpvc -n $ns" "sc=${sc} snapshot=${snapshot}"
-    if $inplace; then
-      # remove ROLLBACK_PVC_YAML_ANN annotation from pvc
-      kcmd annotate pvc "$destpvc" -n "$ns" "${ROLLBACK_PVC_YAML_ANN}-" --overwrite >/dev/null 2>&1 || true
-      kcmd annotate pvc "$destpvc" -n "$ns" "${ROLLBACK_ORIG_PV_ANN}-" --overwrite >/dev/null 2>&1 || true
-    fi
   fi
 
   if wait_pvc_bound "$ns" "$destpvc" "$BIND_TIMEOUT_SECONDS"; then
@@ -1030,6 +1086,40 @@ extract_event_reason() {
           end'
 }
 
+detect_generic_pv2_mode() {
+  if [[ "${#MIG_PVCS[@]}" -gt 0 ]]; then
+        for pvc_entry in "${MIG_PVCS[@]}"; do
+            local _ns="${pvc_entry%%|*}"
+            local _name="${pvc_entry##*|}"
+            local _pv="$(kcmd get pvc "$_name" -n "$_ns" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)"
+            [[ -z "$_pv" ]] && continue
+            local _zone="$(extract_zone_from_pv_nodeaffinity "$_pv" || true)"
+            if [[ -n "$_zone" ]]; then
+                _UNIQUE_ZONES["$_zone"]=1
+            fi
+
+            is_created_by_migrator=$(is_pvc_in_migration "$_name" "$_ns")
+            if [[ $is_created_by_migrator == "true" ]]; then
+               info "skipping detect_generic_pv2_mode as the migration have already kicked in"
+               return
+            fi
+
+            is_migration=$(is_pvc_created_by_migration_tool "$_name" "$_ns")
+            if [[ $is_migration == "true" ]]; then
+                info "skipping detect_generic_pv2_mode as there are pvcs created by migration tool"
+                return
+            fi
+        done
+    fi
+    local _unique_zone_count="${#_UNIQUE_ZONES[@]}"
+    if [[ "$_unique_zone_count" == "1" && "$SINGLE_ZONE_USE_GENERIC_PV2_SC" == "true" ]]; then
+        info "Single zone detected across all PVCs; will use generic pv2 naming (<origSC>-pv2) instead of zone suffix."
+        GENERIC_PV2_SC_MODE=1
+    else
+        GENERIC_PV2_SC_MODE=0
+    fi
+}
+
 populate_pvcs() {
   if [[ -z "$NAMESPACE" ]]; then
     mapfile -t MIG_PVCS < <(kcmd get pvc --all-namespaces -l "$MIGRATION_LABEL" -o jsonpath='{range .items[*]}{.metadata.namespace}{"|"}{.metadata.name}{"\n"}{end}')
@@ -1085,7 +1175,8 @@ create_unique_storage_classes() {
     [[ -n "$sc" ]] && SC_SET["$sc"]=1
   done
   SOURCE_SCS=("${!SC_SET[@]}")
-  info "Source StorageClasses: ${SOURCE_SCS[*]}"
+  info "Source StorageClasses:"
+  printf '  %s\n' "${SOURCE_SCS[@]}"
   create_variants_for_sources "${SOURCE_SCS[@]}"
 }
 
@@ -1275,26 +1366,44 @@ EOF
     audit_add "VolumeSnapshot" "$snap" "$ns" "create" "kubectl delete volumesnapshot $snap -n $ns" "$extra"
   fi
 
-  # Wait up to 3 minutes (36 * 5s) – same as dual
-  for _ in {1..36}; do
-    local ready
-    ready=$(kcmd get volumesnapshot "$snap" -n "$ns" -o jsonpath='{.status.readyToUse}' 2>/dev/null || true)
-    [[ "$ready" == "true" ]] && { ok "Snapshot $ns/$snap ready"; return 0; }
-    sleep 5
-  done
-  audit_add "VolumeSnapshot" "$snap" "$ns" "not-ready" "N/A" "sourcePVC=$source_pvc recreate=$recreated reason=timeout"
-  warn "Snapshot $ns/$snap not ready after timeout"
-  return 1
+  SNAPSHOTS_ARRAY+=("$ns|$snap|$source_pvc")
 }
 
 # --- Snapshot routines ---
-ensure_snapshot() {
+create_snapshot() {
   local snap=$1 source_pvc="$2" ns="$3" pv="$4"
   set +e
   ensure_volume_snapshot "$ns" "$source_pvc" "$snap"
   rc=$?
   set -e
   return $rc
+}
+
+wait_for_snapshots_ready() {
+  info "Waiting for all snapshots to be ready..."
+  SOURCE_SNAPSHOTS=("${!SNAPSHOTS_ARRAY[@]}")
+  info "Source Snapshots:"
+  printf '  %s\n' "${SOURCE_SNAPSHOTS[@]}"
+
+  for ns_snap in "${SOURCE_SNAPSHOTS[@]}"; do
+    IFS='|' read -r ns snap source_pvc <<< "$ns_snap"
+    local ready
+
+    info "Waiting for snapshot $ns/$snap to be ready..."
+     # Wait up to 3 minutes (36 * 5s) – same as dual
+    for _ in {1..36}; do
+      ready=$(kcmd get volumesnapshot "$snap" -n "$ns" -o jsonpath='{.status.readyToUse}' 2>/dev/null || true)
+      [[ "$ready" == "true" ]] && { break; }
+      sleep 5
+    done
+    if [[ "$ready" == "true" ]]; then
+      ok "Snapshot $ns/$snap ready"; 
+      continue
+    fi
+    audit_add "VolumeSnapshot" "$snap" "$ns" "not-ready" "N/A" "sourcePVC=$source_pvc reason=timeout"
+    warn "Snapshot $ns/$snap not ready after timeout"
+    return 1
+  done
 }
 
 print_migration_cleanup_report() {

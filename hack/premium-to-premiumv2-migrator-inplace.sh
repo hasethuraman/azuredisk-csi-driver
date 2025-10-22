@@ -38,8 +38,12 @@ safe_array_len() {
   eval "echo \${#${name}[@]}"
 }
 
+# Zonal-aware helper lib
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-. "${SCRIPT_DIR}/lib-premiumv2-migration-common.sh"
+ZONAL_HELPER_LIB="${SCRIPT_DIR}/premium-to-premiumv2-zonal-aware-helper.sh"
+[[ -f "$ZONAL_HELPER_LIB" ]] || { echo "[ERROR] Missing lib: $ZONAL_HELPER_LIB" >&2; exit 1; }
+# shellcheck disable=SC1090
+. "$ZONAL_HELPER_LIB"
 
 # Run RBAC preflight (mode=inplace)
 MODE=$MODE migration_rbac_check || { err "Aborting due to insufficient permissions."; exit 1; }
@@ -83,7 +87,7 @@ ensure_no_foreign_conflicts() {
 }
 
 # ---------------- Discover Tagged PVCs ----------------
-populate_pvcs
+MODE=$MODE process_pvcs_for_zone_preparation
 
 # ---------------- Pre-Requisite Validation (mirrors dual script) ----------------
 print_combined_validation_report_and_exit_if_needed() {
@@ -129,13 +133,21 @@ rollback_inplace() {
   local spec_doc
   spec_doc=$(printf '%s' "$encoded" | b64d)
 
+  if [[ -z "$spec_doc" ]]; then
+    warn "Empty rollback spec"
+    audit_add "PersistentVolumeClaim" "$pvc" "$ns" "rollback-empty-spec" "N/A" "reason=emptySpec"
+    ROLLBACK_FAILURES+=("${ns}/${pvc}:empty-spec")
+    return 1
+  fi
+
   # Delete pv2 PVC (best-effort)
+  encoded_spec=$(get_pvc_encoded_json "$pvc" "$ns")
   if ! kcmd delete pvc "$pvc" -n "$ns" --wait=true; then
     warn "Rollback delete failed (continuing) for $ns/$pvc"
     audit_add "PersistentVolumeClaim" "$pvc" "$ns" "rollback-delete-failed" "N/A" "reason=deleteError"
     # Continue – apply may still succeed if object was already gone
   else
-    audit_add "PersistentVolumeClaim" "$pvc" "$ns" "rollback-delete" "N/A" ""
+    audit_add "PersistentVolumeClaim" "$pvc" "$ns" "rollback-delete" "kubectl create -f <(echo \"$encoded_spec\" | base64 --decode) " "inplace=true reason=rollbackreplace"
   fi
 
   # Clear the claimRef on the original PV to allow re-binding
@@ -175,6 +187,7 @@ rollback_inplace() {
 }
 
 # ------------- Main Migration Loop -------------
+declare -A PVC_SNAPSHOTS
 for ENTRY in "${MIG_PVCS[@]}"; do
   pvc_ns="${ENTRY%%|*}"
   pvc="${ENTRY##*|}"
@@ -225,7 +238,25 @@ for ENTRY in "${MIG_PVCS[@]}"; do
   fi
 
   snapshot="$(name_snapshot "$pv")"
-  ensure_snapshot "$snapshot" "$snapshot_source_pvc" "$pvc_ns" "$pv" || { warn "Snapshot failed $pvc_ns/$pvc"; continue; }
+  create_snapshot "$snapshot" "$snapshot_source_pvc" "$pvc_ns" "$pv" || { warn "Snapshot failed $pvc_ns/$pvc"; continue; }
+
+  PVC_SNAPSHOTS+=("${pvc_ns}|${snapshot}|${pvc}")
+done
+
+wait_for_snapshots_ready
+
+# ------------- Main Migration Loop -------------
+SOURCE_SNAPSHOTS=("${!PVC_SNAPSHOTS[@]}")
+for ENTRY in "${SOURCE_SNAPSHOTS[@]}"; do
+  IFS='|' read -r pvc_ns snapshot pvc <<< "$ENTRY"
+  pv=$(kcmd get pvc "$pvc" -n "$pvc_ns" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)
+
+  mode=$(kcmd get pv "$pv" -o jsonpath='{.spec.volumeMode}' 2>/dev/null || true)
+  sc=$(get_sc_of_pvc "$pvc" "$pvc_ns")
+  size=$(kcmd get pv "$pv" -o jsonpath='{.spec.capacity.storage}' 2>/dev/null || true)
+  diskuri=$(kcmd get pv "$pv" -o jsonpath='{.spec.azureDisk.diskURI}' 2>/dev/null || true)
+  scpv2="$(name_pv2_sc "$sc")"
+
   run_without_errexit create_pvc_from_snapshot "$pvc" "$pvc_ns" "$pv" "$size" "$mode" "$scpv2" "$pvc" "$snapshot"
   rc=$LAST_RUN_WITHOUT_ERREXIT_RC
   if [[ $rc -eq 0 ]]; then
@@ -253,7 +284,7 @@ info "Monitoring migrations (timeout ${MONITOR_TIMEOUT_MINUTES}m)..."
 while true; do
   ALL_DONE=true
   for ENTRY in "${MIG_PVCS[@]}"; do
-    pvc_ns="${ENTRY%%|*}" pvc="${ENTRY##*|}" pv2_pvc="$pvc"
+    pvc_ns="${ENTRY%%|*}" pvc="${ENTRY##*|}"
 
     # Skip monitoring for PVCs we never started due to attachment
     if [[ ${NON_DETACHED_SET["${pvc_ns}|${pvc}"]+x} ]]; then
@@ -261,13 +292,13 @@ while true; do
     fi
 
     lbl=$(kcmd get pvc "$pvc" -n "$pvc_ns" -o go-template="{{ index .metadata.labels \"${MIGRATION_DONE_LABEL_KEY}\" }}" || true)
-    if [[ "$lbl" == "$MIGRATION_DONE_LABEL_VALUE" ]]; then
+    if [[ "$lbl" == "$MIGRATION_DONE_LABEL_VALUE" || "$lbl" == "$MIGRATION_DONE_LABEL_VALUE_FALSE" ]]; then
       continue
     fi
 
-    STATUS=$(kcmd get pvc "$pv2_pvc" -n "$pvc_ns" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+    STATUS=$(kcmd get pvc "$pvc" -n "$pvc_ns" -o jsonpath='{.status.phase}' 2>/dev/null || true)
     [[ "$STATUS" != "Bound" ]] && ALL_DONE=false
-    reason=$(extract_event_reason "$pvc_ns" "$pv2_pvc")
+    reason=$(extract_event_reason "$pvc_ns" "$pvc")
     case "$reason" in
       SKUMigrationCompleted)
         mark_source_done "$pvc_ns" "$pvc"
@@ -275,19 +306,21 @@ while true; do
         continue
         ;;
       SKUMigrationProgress|SKUMigrationStarted)
-        info "$reason $pvc_ns/$pv2_pvc"; ALL_DONE=false ;;
+        mark_source_in_progress "$pvc_ns" "$pvc"
+        info "$reason $pvc_ns/$pvc"; ALL_DONE=false ;;
       ReasonSKUMigrationTimeout)
-        rollback_inplace "$pvc_ns" "$pv2_pvc" || true
-        warn "$reason $pvc_ns/$pv2_pvc"; ALL_DONE=false ;;
+        rollback_inplace "$pvc_ns" "$pvc" || true
+        mark_source_notdone "$pvc_ns" "$pvc"
+        warn "$reason $pvc_ns/$pvc"; ALL_DONE=false ;;
       "")
-        info "No migration events yet for $pvc_ns/$pv2_pvc"; ALL_DONE=false ;;
+        info "No migration events yet for $pvc_ns/$pvc"; ALL_DONE=false ;;
     esac
     if [[ "$STATUS" == "Bound" && -z "$reason" && $MIGRATION_FORCE_INPROGRESS_AFTER_MINUTES -gt 0 ]]; then
       orig_pv=$(kcmd get pvc "$pvc" -n "$pvc_ns" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)
       [[ -z "$orig_pv" ]] && continue
       inprog_val=$(kcmd get pv "$orig_pv" -o go-template="{{ index .metadata.labels \"${MIGRATION_INPROGRESS_LABEL_KEY}\" }}" 2>/dev/null || true)
       if [[ "$inprog_val" != "$MIGRATION_INPROGRESS_LABEL_VALUE" ]]; then
-        cts=$(kcmd get pvc "$pv2_pvc" -n "$pvc_ns" -o jsonpath='{.metadata.creationTimestamp}' 2>/dev/null || true)
+        cts=$(kcmd get pvc "$pvc" -n "$pvc_ns" -o jsonpath='{.metadata.creationTimestamp}' 2>/dev/null || true)
         if [[ -n "$cts" ]]; then
           creation_epoch=$(date -d "$cts" +%s 2>/dev/null || echo 0)
           now_epoch=$(date +%s)

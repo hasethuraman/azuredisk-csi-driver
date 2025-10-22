@@ -38,8 +38,12 @@ safe_array_len() {
   eval "echo \${#${name}[@]}"
 }
 
+# Zonal-aware helper lib
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-. "${SCRIPT_DIR}/lib-premiumv2-migration-common.sh"
+ZONAL_HELPER_LIB="${SCRIPT_DIR}/premium-to-premiumv2-zonal-aware-helper.sh"
+[[ -f "$ZONAL_HELPER_LIB" ]] || { echo "[ERROR] Missing lib: $ZONAL_HELPER_LIB" >&2; exit 1; }
+# shellcheck disable=SC1090
+. "$ZONAL_HELPER_LIB"
 
 # Run RBAC preflight (mode=dual)
 MODE=$MODE migration_rbac_check || { err "Aborting due to insufficient permissions."; exit 1; }
@@ -52,7 +56,7 @@ info "Max PVCs: $MAX_PVCS  MIG_SUFFIX=$MIG_SUFFIX  WAIT_FOR_WORKLOAD=$WAIT_FOR_W
 ensure_snapshot_class   # from common lib
 
 # ---------------- Discover Tagged PVCs ----------------
-populate_pvcs
+MODE=$MODE process_pvcs_for_zone_preparation
 
 # --- Conflict / prerequisite logic reused only here (kept local) ---
 ensure_no_foreign_conflicts() {
@@ -141,6 +145,7 @@ run_prerequisites_and_conflicts
 create_unique_storage_classes
 
 # ------------- Main Migration Loop -------------
+declare -A PVC_SNAPSHOTS
 for ENTRY in "${MIG_PVCS[@]}"; do
   pvc_ns="${ENTRY%%|*}"
   pvc="${ENTRY##*|}"
@@ -189,9 +194,23 @@ for ENTRY in "${MIG_PVCS[@]}"; do
     snapshot_source_pvc="$pvc"
   fi
 
-  pv2_pvc="$(name_pv2_pvc "$pvc")"
   snapshot="$(name_snapshot "$pv")"
-  ensure_snapshot "$snapshot" "$snapshot_source_pvc" "$pvc_ns" "$pv" || { warn "Snapshot failed $pvc_ns/$pvc"; continue; }
+  create_snapshot "$snapshot" "$snapshot_source_pvc" "$pvc_ns" "$pv" || { warn "Snapshot failed $pvc_ns/$pvc"; continue; }
+  PVC_SNAPSHOTS+=("${pvc_ns}|${snapshot}|${pvc}")
+done
+
+wait_for_snapshots_ready
+
+SOURCE_SNAPSHOTS=("${!PVC_SNAPSHOTS[@]}")
+for ENTRY in "${SOURCE_SNAPSHOTS[@]}"; do
+  IFS='|' read -r pvc_ns snapshot pvc <<< "$ENTRY"
+  pv=$(kcmd get pvc "$pvc" -n "$pvc_ns" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)
+  size=$(kcmd get pv "$pv" -o jsonpath='{.spec.capacity.storage}' 2>/dev/null || true)
+  mode=$(kcmd get pv "$pv" -o jsonpath='{.spec.volumeMode}' 2>/dev/null || true)
+  sc=$(get_sc_of_pvc "$pvc" "$pvc_ns")
+  scpv2="$(name_pv2_sc "$sc")"
+  pv2_pvc="$(name_pv2_pvc "$pvc")"
+
   run_without_errexit create_pvc_from_snapshot "$pvc" "$pvc_ns" "$pv" "$size" "$mode" "$scpv2" "$pv2_pvc" "$snapshot"
   case "$LAST_RUN_WITHOUT_ERREXIT_RC" in
     0) ;; # success
@@ -215,7 +234,7 @@ while true; do
     fi
 
     lbl=$(kcmd get pvc "$pvc" -n "$pvc_ns" -o go-template="{{ index .metadata.labels \"${MIGRATION_DONE_LABEL_KEY}\" }}" || true)
-    if [[ "$lbl" == "$MIGRATION_DONE_LABEL_VALUE" ]]; then
+    if [[ "$lbl" == "$MIGRATION_DONE_LABEL_VALUE" || "$lbl" == "$MIGRATION_DONE_LABEL_VALUE_FALSE" ]]; then
       continue
     fi
 
@@ -229,7 +248,11 @@ while true; do
         continue
         ;;
       SKUMigrationProgress|SKUMigrationStarted)
+        mark_source_in_progress "$pvc_ns" "$pvc"
         info "$reason $pvc_ns/$pv2_pvc"; ALL_DONE=false ;;
+      ReasonSKUMigrationTimeout)
+        mark_source_notdone "$pvc_ns" "$pvc"
+        warn "$reason $pvc_ns/$pv2_pvc"; ALL_DONE=false ;;
       "")
         info "No migration events yet for $pvc_ns/$pv2_pvc"; ALL_DONE=false ;;
     esac
