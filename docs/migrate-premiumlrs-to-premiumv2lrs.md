@@ -143,9 +143,6 @@ kubectl label pvc data-app-b -n team-b disk.csi.azure.com/pv2migration=true
 
 # Or with zone mapping file
 ZONE_MAPPING_FILE=disk-zone-mapping.txt ./premium-to-premiumv2-zonal-aware-helper.sh process
-
-# Process single PVC for testing
-./premium-to-premiumv2-zonal-aware-helper.sh process-single my-pvc my-namespace
 ```
 
 ### 4.4 What the Zone Helper Creates
@@ -223,7 +220,7 @@ The script will:
 
 ### 4.9 Integration with Migration Scripts
 
-**IMPORTANT**: Run the zone preparation **before** any migration script:
+**IMPORTANT**: Run the zone preparation **before** any migration script if zonal information is not present in StorageClass or PersistentVolume:
 
 ```bash
 # 1. FIRST: Label PVCs for migration
@@ -363,7 +360,7 @@ kubectl get pvc data-app-a -n team-a -o jsonpath='{.metadata.annotations.disk\.c
 
 Change to repository root or `hack/` directory.
 
-**Zone preparation (MANDATORY FIRST STEP)**:
+**Zone preparation (MANDATORY FIRST STEP IF ZONAL INFORMATION NOT AVAILABLE IN SC/PV)**:
 ```bash
 cd hack
 # Run zone preparation for all labeled PVCs
@@ -703,7 +700,7 @@ Summary:
 # Label a target PVC
 kubectl label pvc data-app-a -n team-a disk.csi.azure.com/pv2migration=true
 
-# Run zone preparation (MANDATORY FIRST)
+# Run zone preparation (MANDATORY FIRST IF ZONAL INFORMATION NOT AVAILABLE IN PV/SC)
 cd hack
 ./premium-to-premiumv2-zonal-aware-helper.sh process
 
@@ -724,7 +721,7 @@ kubectl describe pv $(kubectl get pvc data-app-a -n team-a -o jsonpath='{.spec.v
 ```bash
 kubectl label pvc data-app-b -n team-b disk.csi.azure.com/pv2migration=true
 
-# Run zone preparation first
+# Run zone preparation first (IF ZONAL INFORMATION NOT AVAILABLE IN PV/SC)
 cd hack
 ./premium-to-premiumv2-zonal-aware-helper.sh process
 
@@ -817,7 +814,7 @@ export ZONE_SC_ANNOTATION_KEY=disk.csi.azure.com/migration-sourcesc
 kubectl label pvc data-app-a -n team-a disk.csi.azure.com/pv2migration=true
 kubectl label pvc data-app-b -n team-b disk.csi.azure.com/pv2migration=true
 
-# 2. MANDATORY: Run zone-aware preparation
+# 2. MANDATORY: Run zone-aware preparation (IF ZONAL INFORMATION NOT AVAILABLE IN PV/SC)
 cd hack
 ./premium-to-premiumv2-zonal-aware-helper.sh process | tee zone-prep-$(date +%Y%m%d-%H%M%S).log
 

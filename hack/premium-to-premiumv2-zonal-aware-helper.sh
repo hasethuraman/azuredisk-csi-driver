@@ -77,7 +77,8 @@ extract_zone_from_storageclass() {
 }
 
 # Extract zone from PV nodeAffinity
-# Returns the zone if exactly one topology term with one zone is found
+# Returns the zone if exactly one matching zone expression is found
+# Only considers recognized zone keys to avoid accidentally pulling region or other topology labels.
 extract_zone_from_pv_nodeaffinity() {
     local pv_name="$1"
     local pv_json zone_count
@@ -85,12 +86,13 @@ extract_zone_from_pv_nodeaffinity() {
     pv_json=$(kcmd get pv "$pv_name" -o json 2>/dev/null || true)
     [[ -z "$pv_json" ]] && return 1
     
-    # Extract zones from nodeAffinity
+    # Extract zones from nodeAffinity restricted to zone keys
     local zones_json
     zones_json=$(echo "$pv_json" | jq -r '
         .spec.nodeAffinity.required.nodeSelectorTerms // []
         | map(.matchExpressions // [])
         | flatten
+        | map(select(.key == "topology.disk.csi.azure.com/zone"))
         | map(.values // [])
         | flatten
         | unique
@@ -122,50 +124,47 @@ get_disk_uri_from_pv() {
     echo "$disk_uri"
 }
 
-# Determine zone for a PVC
-# Returns: zone string or empty string if not determinable
+# Determine zone for a PVC (updated priority: PV nodeAffinity first)
+# Exit codes:
+#   0 -> zone from PV nodeAffinity
+#   1 -> zone from StorageClass allowedTopologies
+#   2 -> zone from mapping file
+#   3 -> failed to determine zone
 determine_zone_for_pvc() {
     local pvc_name="$1" pvc_ns="$2"
-    local sc_name pv_name zone disk_uri
+    local sc_name pv_name zone disk_uri rc
     
-    # Get StorageClass and PV
     sc_name=$(kcmd get pvc "$pvc_name" -n "$pvc_ns" -o jsonpath='{.spec.storageClassName}' 2>/dev/null || true)
     pv_name=$(kcmd get pvc "$pvc_name" -n "$pvc_ns" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)
     
-    [[ -z "$sc_name" ]] && { warn "PVC $pvc_ns/$pvc_name has no storageClassName"; return 2; }
-    [[ -z "$pv_name" ]] && { warn "PVC $pvc_ns/$pvc_name has no bound PV"; return 2; }
+    [[ -z "$sc_name" ]] && { warn "PVC $pvc_ns/$pvc_name has no storageClassName"; return 3; }
+    [[ -z "$pv_name" ]] && { warn "PVC $pvc_ns/$pvc_name has no bound PV"; return 3; }
     
-    # Step 1: Check StorageClass allowedTopologies
-    zone=$(extract_zone_from_storageclass "$sc_name")
-    case $? in
-        0) 
-            echo "$zone"
-            return 0
-            ;;
-        *) 
-            # Continue to next step
-            ;;
-    esac
+    # Priority Step 1: PV nodeAffinity (most authoritative actual placement)
+    zone=$(extract_zone_from_pv_nodeaffinity "$pv_name"); rc=$?
+    if [[ $rc -eq 0 && -n "$zone" ]]; then
+        printf '%s\n' "$zone"
+        return 0
+    fi
     
-    # Step 2: Check PV nodeAffinity
-    zone=$(extract_zone_from_pv_nodeaffinity "$pv_name")
-    if [[ $? -eq 0 && -n "$zone" ]]; then
-        echo "$zone"
+    # Priority Step 2: StorageClass allowedTopologies (design intent)
+    zone=$(extract_zone_from_storageclass "$sc_name"); rc=$?
+    if [[ $rc -eq 0 && -n "$zone" ]]; then
+        printf '%s\n' "$zone"
         return 1
     fi
-
-    # Step 3: Check zone mapping file
+    
+    # Priority Step 3: Mapping file fallback
     disk_uri=$(get_disk_uri_from_pv "$pv_name")
     disk_uri=$(echo "$disk_uri" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')
     if [[ -n "$disk_uri" && -n "${DISK_ZONE_MAP[$disk_uri]:-}" ]]; then
         zone="${DISK_ZONE_MAP[$disk_uri]}"
         echo "$zone"
-        return 1
+        return 2
     fi
-
-    # No zone information found
+    
     warn "Unable to determine zone for PVC $pvc_ns/$pvc_name (SC: $sc_name, PV: $pv_name, Disk: ${disk_uri:-unknown})"
-    return 2
+    return 3
 }
 
 # Create zone-specific StorageClass with comprehensive property preservation
@@ -417,51 +416,56 @@ process_pvc_for_zone_migration() {
     
     info "Processing PVC $pvc_ns/$pvc_name for zone-aware migration"
     
-    # Check if already processed
     local existing_annotation
     existing_annotation=$(kcmd get pvc "$pvc_name" -n "$pvc_ns" -o jsonpath="{.metadata.annotations.${ZONE_SC_ANNOTATION_KEY//./\\.}}" 2>/dev/null || true)
     if [[ -n "$existing_annotation" ]]; then
-        info "PVC $pvc_ns/$pvc_name already has zone-specific StorageClass annotation: $existing_annotation"
+        info "PVC $pvc_ns/$pvc_name already annotated with zone-specific StorageClass: $existing_annotation (skipping)"
         return 0
     fi
     
-    # Determine zone
     local zone
     zone=$(determine_zone_for_pvc "$pvc_name" "$pvc_ns")
-    case $? in
+    local zone_src_rc=$?
+    case $zone_src_rc in
         0)
-            info "Storage class has zone already for PVC $pvc_ns/$pvc_name: $zone"
-            return 1
+            info "Zone determined from PV nodeAffinity for PVC $pvc_ns/$pvc_name: $zone"
             ;;
         1)
-            info "Determined zone for PVC $pvc_ns/$pvc_name: $zone"
+            info "Zone inferred from StorageClass allowedTopologies for PVC $pvc_ns/$pvc_name: $zone"
+            return 1
+            ;;
+        2)
+            info "Zone resolved from mapping file for PVC $pvc_ns/$pvc_name: $zone"
             ;;
         *)
-            warn "Failed to determine zone for PVC $pvc_ns/$pvc_name"
+            warn "Failed to determine zone for PVC $pvc_ns/$pvc_name (rc=$zone_src_rc)"
             return 2
             ;;
     esac
 
-    # Get original StorageClass
     local orig_sc
     orig_sc=$(kcmd get pvc "$pvc_name" -n "$pvc_ns" -o jsonpath='{.spec.storageClassName}' 2>/dev/null || true)
     [[ -z "$orig_sc" ]] && { err "PVC $pvc_ns/$pvc_name has no storageClassName"; return 2; }
     
-    # Create zone-specific StorageClass
-    local zone_sc="${orig_sc}-${zone}"
-    create_zone_specific_storageclass "$orig_sc" "$zone" "Premium_LRS" "$zone_sc"
-    if [[ $? -ne 0 ]]; then
-        err "Failed to create zone-specific StorageClass for $orig_sc zone $zone"
+    local zone_sc
+    if [[ "${GENERIC_PV2_SC_MODE:-0}" == "1" ]]; then
+        # Reuse generic naming, keep zone constraint inside the SC spec
+        zone_sc="$(name_pv2_sc "$orig_sc")"
+    else
+        zone_sc="${orig_sc}-${zone}"
+    fi
+
+    if ! create_zone_specific_storageclass "$orig_sc" "$zone" "Premium_LRS" "$zone_sc"; then
+        err "Failed to create zone-specific StorageClass $zone_sc (zone=$zone orig=$orig_sc)"
         return 2
     fi
     
-    # Annotate PVC
     if ! annotate_pvc_with_zone_storageclass "$pvc_name" "$pvc_ns" "$zone_sc" "$zone"; then
-        err "Failed to annotate PVC $pvc_ns/$pvc_name"
+        err "Failed to annotate PVC $pvc_ns/$pvc_name with zone SC $zone_sc"
         return 2
     fi
     
-    ok "Successfully processed PVC $pvc_ns/$pvc_name for zone $zone (StorageClass: $zone_sc)"
+    ok "PVC $pvc_ns/$pvc_name zone=$zone (source=$zone_src_rc) annotated with $zone_sc"
     return 0
 }
 
@@ -485,18 +489,38 @@ process_pvcs_for_zone_preparation() {
     fi
     
     # Check prerequisites
-    migration_rbac_check || exit 1
+    if is_direct_exec; then
+        migration_rbac_check || exit 1
+    fi
     
     # Populate PVCs marked for migration
     populate_pvcs
-    
-    info "Processing ${#MIG_PVCS[@]} PVCs for zone preparation"
-    run_prerequisites_checks
+    detect_generic_pv2_mode
+
+    if is_direct_exec; then
+        run_prerequisites_checks
+    else
+        info "Skipping run_prerequisites_checks (script sourced)"
+    fi
     
     local processed=0 skipped=0 failed=0
     for pvc_entry in "${MIG_PVCS[@]}"; do
         local pvc_ns="${pvc_entry%%|*}"
         local pvc_name="${pvc_entry##*|}"
+
+        is_created_by_migrator=$(is_pvc_in_migration "$pvc_name" "$pvc_ns")
+        if [[ $is_created_by_migrator == "true" ]]; then
+            info "Skipping PVC $pvc_ns/$pvc_name (created by migration tool)"
+            skipped=$((skipped + 1))
+            continue
+        fi
+
+        is_migration=$(is_pvc_created_by_migration_tool "$pvc_name" "$pvc_ns")
+        if [[ $is_migration == "true" ]]; then
+            info "Skipping PVC $pvc_ns/$pvc_name (already in migration)"
+            skipped=$((skipped + 1))
+            continue
+        fi
 
         # Check if PVC already has zone-specific StorageClass annotation
         local existing_annotation
@@ -520,15 +544,32 @@ process_pvcs_for_zone_preparation() {
                 ;;
         esac
     done
-    
-    echo
-    ok "Zone-aware PVC processing complete:"
-    echo "  Processed: $processed"
-    echo "  Skipped: $skipped"
-    echo "  Failed: $failed"
-    echo "  Total: ${#MIG_PVCS[@]}"
-    
-    finalize_audit_summary "$start_ts" "$start_epoch"
+      
+    if is_direct_exec; then
+        echo
+        ok "Zone-aware PVC processing complete:"
+        echo "  Processed: $processed"
+        echo "  Skipped: $skipped"
+        echo "  Failed: $failed"
+        echo "  Total: ${#MIG_PVCS[@]}"
+        finalize_audit_summary "$start_ts" "$start_epoch"
+    else
+      if [[ $failed -gt 0 ]]; then
+          err "Zone-aware PVC processing complete with failures:"
+          echo "  Processed: $processed"
+          echo "  Skipped: $skipped"
+          echo "  Failed: $failed"
+          echo "  Total: ${#MIG_PVCS[@]}"
+          return 1
+      else
+          ok "Zone-aware PVC processing complete:"
+          echo "  Processed: $processed"
+          echo "  Skipped: $skipped"
+          echo "  Failed: $failed"
+          echo "  Total: ${#MIG_PVCS[@]}"
+          return 0
+      fi
+    fi
 }
 
 # Generate zone mapping template

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # shellcheck source=./lib-premiumv2-migration-common.sh
+# shellcheck source=./premium-to-premiumv2-zonal-aware-helper.sh
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -16,7 +17,6 @@ ATTR_CLASS_FORCE_RECREATE="${ATTR_CLASS_FORCE_RECREATE:-false}"
 PV_POLL_INTERVAL_SECONDS="${PV_POLL_INTERVAL_SECONDS:-10}"
 SKU_UPDATE_TIMEOUT_MINUTES="${SKU_UPDATE_TIMEOUT_MINUTES:-60}"
 CSI_BASELINE_SC="${CSI_BASELINE_SC:-}"
-ROLLBACK_ON_TIMEOUT="${ROLLBACK_ON_TIMEOUT:-false}"
 
 # Declarations (parity)
 declare -a MIG_PVCS
@@ -45,12 +45,12 @@ safe_array_len() {
   eval "echo \${#${name}[@]}"
 }
 
-# -------- Shared Library --------
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-LIB="${SCRIPT_DIR}/lib-premiumv2-migration-common.sh"
-[[ -f "$LIB" ]] || { echo "[ERROR] Missing lib: $LIB" >&2; exit 1; }
+# Zonal-aware helper lib
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ZONAL_HELPER_LIB="${SCRIPT_DIR}/premium-to-premiumv2-zonal-aware-helper.sh"
+[[ -f "$ZONAL_HELPER_LIB" ]] || { echo "[ERROR] Missing lib: $ZONAL_HELPER_LIB" >&2; exit 1; }
 # shellcheck disable=SC1090
-. "$LIB"
+. "$ZONAL_HELPER_LIB"
 
 # Run RBAC preflight (mode=inplace)
 MODE=$MODE migration_rbac_check || { err "Aborting due to insufficient permissions."; exit 1; }
@@ -110,9 +110,6 @@ ensure_no_foreign_conflicts() {
   ok "No conflicting pre-existing objects detected."
 }
 
-# ---------------- Discover Tagged PVCs ----------------
-populate_pvcs
-
 # ---------------- Pre-Requisite Validation (mirrors dual script) ----------------
 print_combined_validation_report_and_exit_if_needed() {
   local prereq_count
@@ -140,10 +137,13 @@ run_prerequisites_and_conflicts() {
 
 run_prerequisites_and_conflicts
 
+# ---------------- Discover Tagged PVCs ----------------
+MODE=$MODE process_pvcs_for_zone_preparation
+
 # ------------- Collect Unique Source SCs -------------
 create_unique_storage_classes
 
-migrate_pvc_attrclass() {
+migrate_pvc_attributes_class() {
   local ns="$1" pvc="$2"
   info "Processing PVC $ns/$pvc"
   local pv
@@ -152,34 +152,7 @@ migrate_pvc_attrclass() {
     warn "Skip $ns/$pvc (no PV yet)"
     return
   fi
-
-  # Mark in-progress early
-  kubectl label pvc "$pvc" -n "$ns" --overwrite "${MIGRATION_INPROGRESS_LABEL_KEY}=${MIGRATION_INPROGRESS_LABEL_VALUE}" >/dev/null 2>&1 || true
-
-  if is_in_tree_pv "$pv"; then
-    mode=$(kcmd get pv "$pv" -o jsonpath='{.spec.volumeMode}' 2>/dev/null || true)
-    sc=$(kcmd get pv "$pv" -o jsonpath='{.spec.storageClassName}' 2>/dev/null || true)
-    diskuri=$(kcmd get pv "$pv" -o jsonpath='{.spec.azureDisk.diskURI}' 2>/dev/null || true)
-    scpv1="$(name_pv1_sc "$sc")"
-
-    info "In-tree PV ($pv) -> converting"
-    create_csi_pv_pvc "$pvc" "$ns" "$pv" "$size" "$mode" "${scpv1}" "$diskuri" true || {
-      err "Failed to create CSI PV/PVC for $ns/$pvc"
-      audit_add "PersistentVolumeClaim" "$pvc" "$ns" "convert-failed" "N/A" "phase=intree-create-csi"
-      return
-    }
-    pv="$(get_pv_of_pvc "$ns" "$pvc")"
-  else
-    backup_pvc "$pvc" "$ns" || {
-      warn "PVC backup failed $ns/$pvc"
-    }
-  fi
-
-  snapshot="$(name_snapshot "$pv")"
-  ensure_snapshot "$snapshot" "$pvc" "$pvc_ns" "$pv" || {
-    warn "Snapshot failed $pvc_ns/$pvc"
-    return
-  }
+  
   ensure_reclaim_policy_retain "$pv"
   ensure_volume_attributes_class
 
@@ -199,11 +172,51 @@ migrate_pvc_attrclass() {
   audit_add "PersistentVolumeClaim" "$pvc" "$ns" "attrclass-applied" "kubectl describe pvc $pvc -n $ns" "pv=$pv targetSku=${TARGET_SKU}"
 }
 
+trigger_snapshot() {
+  local ns="$1" pvc="$2"
+  info "Processing PVC $ns/$pvc"
+  local pv
+  pv="$(get_pv_of_pvc "$ns" "$pvc")"
+  if [[ -z "$pv" ]]; then
+    warn "Skip $ns/$pvc (no PV yet)"
+    return
+  fi
+
+  # Mark in-progress early
+  kubectl label pvc "$pvc" -n "$ns" --overwrite "${MIGRATION_INPROGRESS_LABEL_KEY}=${MIGRATION_INPROGRESS_LABEL_VALUE}" >/dev/null 2>&1 || true
+
+  if is_in_tree_pv "$pv"; then
+    mode=$(kcmd get pv "$pv" -o jsonpath='{.spec.volumeMode}' 2>/dev/null || true)
+    sc=$(get_sc_of_pvc "$pvc" "$ns")
+    diskuri=$(kcmd get pv "$pv" -o jsonpath='{.spec.azureDisk.diskURI}' 2>/dev/null || true)
+    scpv1="$(name_pv1_sc "$sc")"
+
+    info "In-tree PV ($pv) -> converting"
+    create_csi_pv_pvc "$pvc" "$ns" "$pv" "$size" "$mode" "${scpv1}" "$diskuri" true || {
+      err "Failed to create CSI PV/PVC for $ns/$pvc"
+      audit_add "PersistentVolumeClaim" "$pvc" "$ns" "convert-failed" "N/A" "phase=intree-create-csi"
+      return
+    }
+    pv="$(get_pv_of_pvc "$ns" "$pvc")"
+  else
+    backup_pvc "$pvc" "$ns" || {
+      warn "PVC backup failed $ns/$pvc"
+    }
+  fi
+
+  snapshot="$(name_snapshot "$pv")"
+  create_snapshot "$snapshot" "$pvc" "$pvc_ns" "$pv" || {
+    warn "Snapshot failed $pvc_ns/$pvc"
+    return
+  }
+}
+
 
 info "Candidate PVCs:"
 printf '  %s\n' "${MIG_PVCS[@]}"
 
 # -------- Initial Mutation Pass (apply attr class / conversion) = migration loop --------
+declare -A PVC_SNAPSHOTS
 for ENTRY in "${MIG_PVCS[@]}"; do
   pvc_ns="${ENTRY%%|*}"
   pvc="${ENTRY##*|}"
@@ -240,7 +253,16 @@ for ENTRY in "${MIG_PVCS[@]}"; do
   size=$(kcmd get pv "$pv" -o jsonpath='{.spec.capacity.storage}' 2>/dev/null || true)
   diskuri=$(kcmd get pv "$pv" -o jsonpath='{.spec.azureDisk.diskURI}' 2>/dev/null || true)
 
-  migrate_pvc_attrclass "$pvc_ns" "$pvc"
+  trigger_snapshot "$pvc_ns" "$pvc"
+  PVC_SNAPSHOTS+=("${pvc_ns}|${pvc}")
+done
+
+wait_for_snapshots_ready
+
+SOURCE_SNAPSHOTS=("${!PVC_SNAPSHOTS[@]}")
+for ENTRY in "${SOURCE_SNAPSHOTS[@]}"; do
+  ns="${ENTRY%%|*}" pvc="${ENTRY##*|}"
+  migrate_pvc_attributes_class "$ns" "$pvc"
 done
 
 # -------- Monitoring Loop (events + sku poll) --------
@@ -261,7 +283,7 @@ while true; do
 
     # Already done?
     lbl=$(kcmd get pvc "$pvc" -n "$ns" -o go-template="{{ index .metadata.labels \"${MIGRATION_DONE_LABEL_KEY}\" }}" || true)
-    if [[ "$lbl" == "$MIGRATION_DONE_LABEL_VALUE" ]]; then
+    if [[ "$lbl" == "$MIGRATION_DONE_LABEL_VALUE" || "$lbl" == "$MIGRATION_DONE_LABEL_VALUE_FALSE" ]]; then
       continue
     fi
 
@@ -285,16 +307,13 @@ while true; do
         continue
         ;;
       SKUMigrationProgress|SKUMigrationStarted)
+        mark_source_in_progress "$ns" "$pvc"
         info "$reason $ns/$pvc"
         ALL_DONE=false
         ;;
       ReasonSKUMigrationTimeout)
-        warn "Controller timeout event for $ns/$pvc"
-        if [[ "$ROLLBACK_ON_TIMEOUT" == "true" ]]; then
-          warn "Attempting best-effort rollback (remove attr class)"
-          kubectl patch pvc "$pvc" -n "$ns" --type=json -p '[{"op":"remove","path":"/spec/volumeAttributesClassName"}]' >/dev/null 2>&1 || true
-          audit_add "PersistentVolumeClaim" "$pvc" "$ns" "rollback-attrclass-remove" "N/A" "reason=controller-timeout"
-        fi
+        mark_source_notdone "$ns" "$pvc"
+        warn "$reason $ns/$pv2_pvc"
         ALL_DONE=false
         ;;
       "")
