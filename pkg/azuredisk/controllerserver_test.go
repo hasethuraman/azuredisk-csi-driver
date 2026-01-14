@@ -2840,7 +2840,7 @@ func RunTestCreateSnapshot(t *testing.T, fakeDriverFn func(t *gomock.Controller)
 				mockSnapshotClient.EXPECT().CreateOrUpdate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
 				if d.GetWaitForSnapshotReady() {
 					gomock.InOrder(
-						mockSnapshotClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(snapshot, nil).Times(1),
+						mockSnapshotClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(snapshot, nil).Times(2),
 						mockSnapshotClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, fmt.Errorf("get snapshot error")).AnyTimes(),
 					)
 				} else {
@@ -2890,7 +2890,7 @@ func RunTestCreateSnapshot(t *testing.T, fakeDriverFn func(t *gomock.Controller)
 					gomock.InOrder(
 						mockSnapshotClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).Times(1),
 						mockSnapshotClient.EXPECT().CreateOrUpdate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).Times(1),
-						mockSnapshotClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(snapshot, nil).Times(2),
+						mockSnapshotClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(snapshot, nil).Times(3),
 						mockSnapshotClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).Times(1),
 						mockSnapshotClient.EXPECT().CreateOrUpdate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, fmt.Errorf("test")).Times(1),
 					)
@@ -2898,7 +2898,7 @@ func RunTestCreateSnapshot(t *testing.T, fakeDriverFn func(t *gomock.Controller)
 					gomock.InOrder(
 						mockSnapshotClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).Times(1),
 						mockSnapshotClient.EXPECT().CreateOrUpdate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).Times(1),
-						mockSnapshotClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(snapshot, nil).Times(1),
+						mockSnapshotClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(snapshot, nil).Times(2),
 						mockSnapshotClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).Times(1),
 						mockSnapshotClient.EXPECT().CreateOrUpdate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, fmt.Errorf("test")).Times(1),
 					)
@@ -2945,7 +2945,7 @@ func RunTestCreateSnapshot(t *testing.T, fakeDriverFn func(t *gomock.Controller)
 					gomock.InOrder(
 						mockSnapshotClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).Times(1),
 						mockSnapshotClient.EXPECT().CreateOrUpdate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).Times(1),
-						mockSnapshotClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(snapshot, nil).Times(2),
+						mockSnapshotClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(snapshot, nil).Times(3),
 						mockSnapshotClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).Times(1),
 						mockSnapshotClient.EXPECT().CreateOrUpdate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, fmt.Errorf("existing disk")).Times(1),
 					)
@@ -2953,7 +2953,7 @@ func RunTestCreateSnapshot(t *testing.T, fakeDriverFn func(t *gomock.Controller)
 					gomock.InOrder(
 						mockSnapshotClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).Times(1),
 						mockSnapshotClient.EXPECT().CreateOrUpdate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).Times(1),
-						mockSnapshotClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(snapshot, nil).Times(1),
+						mockSnapshotClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(snapshot, nil).Times(2),
 						mockSnapshotClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).Times(1),
 						mockSnapshotClient.EXPECT().CreateOrUpdate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, fmt.Errorf("existing disk")).Times(1),
 					)
@@ -2997,7 +2997,7 @@ func RunTestCreateSnapshot(t *testing.T, fakeDriverFn func(t *gomock.Controller)
 					},
 					ID: &snapshotID,
 				}
-				mockSnapshotClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).Times(1)
+				mockSnapshotClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).Times(2)
 				mockSnapshotClient.EXPECT().CreateOrUpdate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
 				if d.GetWaitForSnapshotReady() {
 					gomock.InOrder(
@@ -3057,14 +3057,14 @@ func RunTestCreateSnapshot(t *testing.T, fakeDriverFn func(t *gomock.Controller)
 				mockSnapshotClient.EXPECT().CreateOrUpdate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
 				if d.GetWaitForSnapshotReady() {
 					gomock.InOrder(
-						mockSnapshotClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(snapshot, nil).Times(2),
+						mockSnapshotClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(snapshot, nil).Times(3),
 						mockSnapshotClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).Times(1),
 						mockSnapshotClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(snapshot, nil).Times(1),
 						mockSnapshotClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, fmt.Errorf("get snapshot error")).AnyTimes(),
 					)
 				} else {
 					gomock.InOrder(
-						mockSnapshotClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(snapshot, nil).Times(1),
+						mockSnapshotClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(snapshot, nil).Times(2),
 						mockSnapshotClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).Times(1),
 						mockSnapshotClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, fmt.Errorf("get snapshot error")).AnyTimes(),
 					)
@@ -3363,13 +3363,13 @@ func RunTestCreateSnapshot(t *testing.T, fakeDriverFn func(t *gomock.Controller)
 							snapshot.Name = ptr.To(localSnapshotName)
 							snapshot.Properties.ProvisioningState = ptr.To("updating")
 							return snapshot, nil
-						}).Times(1),
+						}).Times(2),
 						mockSnapshotClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(func(_ context.Context, _ string, _ string) (*armcompute.Snapshot, error) {
 							snapshot.ID = ptr.To(fmt.Sprintf("%s%s", snapshotURI, localSnapshotName))
 							snapshot.Name = ptr.To(localSnapshotName)
 							snapshot.Properties.ProvisioningState = ptr.To("succeeded")
 							return snapshot, nil
-						}).Times(2),
+						}).Times(3),
 						mockSnapshotClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).Times(1),
 						mockSnapshotClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(func(_ context.Context, _ string, _ string) (*armcompute.Snapshot, error) {
 							snapshot.ID = ptr.To(fmt.Sprintf("%s%s", snapshotURI, snapshotName))
@@ -3382,7 +3382,7 @@ func RunTestCreateSnapshot(t *testing.T, fakeDriverFn func(t *gomock.Controller)
 							snapshot.Name = ptr.To(localSnapshotName)
 							snapshot.Properties.ProvisioningState = ptr.To("succeeded")
 							return snapshot, nil
-						}).Times(2),
+						}).Times(3),
 						mockSnapshotClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(func(_ context.Context, _ string, _ string) (*armcompute.Snapshot, error) {
 							snapshot.ID = ptr.To(fmt.Sprintf("%s%s", snapshotURI, snapshotName))
 							snapshot.Name = ptr.To(snapshotName)
@@ -3401,6 +3401,7 @@ func RunTestCreateSnapshot(t *testing.T, fakeDriverFn func(t *gomock.Controller)
 						} else {
 							actualresponse, err = d.CreateSnapshot(context.Background(), req)
 							if err != nil {
+								println("Error while polling snapshot:", err.Error())
 								break
 							}
 						}
@@ -3705,6 +3706,18 @@ func TestCreateSnapshot_FreezeIntegration(t *testing.T) {
 		driver.freezeOrchestrator = NewFreezeOrchestrator(driver.kubeClient, driver.snapshotConsistencyMode, driver.fsFreezeWaitTimeoutInMins)
 		driver.freezeOrchestrator.bootstrapComplete = true
 
+		// Bootstrap VolumeAttachment tracker (initialize the tracker without starting informer)
+		err = driver.freezeOrchestrator.BootstrapVolumeAttachmentTracking(context.Background())
+		if err != nil {
+			t.Fatalf("Failed to bootstrap VolumeAttachment tracker: %v", err)
+		}
+
+		// Bootstrap VolumeAttachment tracker (initialize the tracker without starting informer)
+		err = driver.freezeOrchestrator.BootstrapVolumeAttachmentTracking(context.Background())
+		if err != nil {
+			t.Fatalf("Failed to bootstrap VolumeAttachment tracker: %v", err)
+		}
+
 		// Mock VolumeSnapshot CRD client operations
 		ctrl := gomock.NewController(t)
 		defer ctrl.Finish()
@@ -3890,6 +3903,18 @@ func TestCreateSnapshot_FreezeIntegration(t *testing.T) {
 		driver.freezeOrchestrator = NewFreezeOrchestrator(driver.kubeClient, driver.snapshotConsistencyMode, driver.fsFreezeWaitTimeoutInMins)
 		driver.freezeOrchestrator.bootstrapComplete = true
 
+		// Bootstrap VolumeAttachment tracker (initialize the tracker without starting informer)
+		err = driver.freezeOrchestrator.BootstrapVolumeAttachmentTracking(context.Background())
+		if err != nil {
+			t.Fatalf("Failed to bootstrap VolumeAttachment tracker: %v", err)
+		}
+
+		// Bootstrap VolumeAttachment tracker (initialize the tracker without starting informer)
+		err = driver.freezeOrchestrator.BootstrapVolumeAttachmentTracking(context.Background())
+		if err != nil {
+			t.Fatalf("Failed to bootstrap VolumeAttachment tracker: %v", err)
+		}
+
 		snapshotName := "test-snapshot-strict"
 		pvName := "test-pv-strict"
 
@@ -3918,7 +3943,7 @@ func TestCreateSnapshot_FreezeIntegration(t *testing.T) {
 				Name: "test-va-strict",
 				Annotations: map[string]string{
 					freeze.AnnotationFreezeRequired: time.Now().Format(time.RFC3339),
-					freeze.AnnotationFreezeState:    "error: operation not supported",
+					freeze.AnnotationFreezeState:    freeze.FreezeStateFailed,
 				},
 			},
 			Spec: storagev1.VolumeAttachmentSpec{
@@ -3935,6 +3960,20 @@ func TestCreateSnapshot_FreezeIntegration(t *testing.T) {
 		_, err = driver.kubeClient.StorageV1().VolumeAttachments().Create(context.Background(), volumeAttachment, metav1.CreateOptions{})
 		if err != nil {
 			t.Fatalf("Failed to create VolumeAttachment: %v", err)
+		}
+
+		// Re-bootstrap to add this VolumeAttachment to the tracker
+		driver.freezeOrchestrator.vaTrackerInitialized.Store(false)
+		err = driver.freezeOrchestrator.BootstrapVolumeAttachmentTracking(context.Background())
+		if err != nil {
+			t.Fatalf("Failed to re-bootstrap VolumeAttachment tracker: %v", err)
+		}
+
+		// Re-bootstrap to add this VolumeAttachment to the tracker
+		driver.freezeOrchestrator.vaTrackerInitialized.Store(false)
+		err = driver.freezeOrchestrator.BootstrapVolumeAttachmentTracking(context.Background())
+		if err != nil {
+			t.Fatalf("Failed to re-bootstrap VolumeAttachment tracker: %v", err)
 		}
 
 		// Mock snapshot client (no snapshot should be created since freeze failed in strict mode)
@@ -4088,6 +4127,18 @@ func TestCreateSnapshot_FreezeIntegration(t *testing.T) {
 		driver.freezeOrchestrator = NewFreezeOrchestrator(driver.kubeClient, driver.snapshotConsistencyMode, driver.fsFreezeWaitTimeoutInMins)
 		driver.freezeOrchestrator.bootstrapComplete = true
 
+		// Bootstrap VolumeAttachment tracker (initialize the tracker without starting informer)
+		err = driver.freezeOrchestrator.BootstrapVolumeAttachmentTracking(context.Background())
+		if err != nil {
+			t.Fatalf("Failed to bootstrap VolumeAttachment tracker: %v", err)
+		}
+
+		// Bootstrap VolumeAttachment tracker (initialize the tracker without starting informer)
+		err = driver.freezeOrchestrator.BootstrapVolumeAttachmentTracking(context.Background())
+		if err != nil {
+			t.Fatalf("Failed to bootstrap VolumeAttachment tracker: %v", err)
+		}
+
 		// Mock VolumeSnapshot CRD client operations
 		ctrl := gomock.NewController(t)
 		defer ctrl.Finish()
@@ -4163,6 +4214,20 @@ func TestCreateSnapshot_FreezeIntegration(t *testing.T) {
 			t.Fatalf("Failed to create VolumeAttachment: %v", err)
 		}
 
+		// Re-bootstrap to add this VolumeAttachment to the tracker
+		driver.freezeOrchestrator.vaTrackerInitialized.Store(false)
+		err = driver.freezeOrchestrator.BootstrapVolumeAttachmentTracking(context.Background())
+		if err != nil {
+			t.Fatalf("Failed to re-bootstrap VolumeAttachment tracker: %v", err)
+		}
+
+		// Re-bootstrap to add this VolumeAttachment to the tracker
+		driver.freezeOrchestrator.vaTrackerInitialized.Store(false)
+		err = driver.freezeOrchestrator.BootstrapVolumeAttachmentTracking(context.Background())
+		if err != nil {
+			t.Fatalf("Failed to re-bootstrap VolumeAttachment tracker: %v", err)
+		}
+
 		// Mock Azure snapshot client
 		mockAzureSnapshotClient := mock_snapshotclient.NewMockInterface(ctrl)
 		driver.clientFactory.(*mock_azclient.MockClientFactory).EXPECT().GetSnapshotClientForSub(gomock.Any()).Return(mockAzureSnapshotClient, nil).AnyTimes()
@@ -4202,7 +4267,7 @@ func TestCreateSnapshot_FreezeIntegration(t *testing.T) {
 		}
 
 		// Simulate node driver completing the freeze (update VolumeAttachment)
-		va.Annotations[freeze.AnnotationFreezeState] = "frozen"
+		va.Annotations[freeze.AnnotationFreezeState] = freeze.FreezeStateFrozen
 		_, err = driver.kubeClient.StorageV1().VolumeAttachments().Update(context.Background(), va, metav1.UpdateOptions{})
 		if err != nil {
 			t.Fatalf("Failed to update VolumeAttachment with freeze complete: %v", err)

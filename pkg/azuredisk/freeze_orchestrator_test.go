@@ -63,17 +63,17 @@ func TestNewFreezeOrchestrator(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			fo := NewFreezeOrchestrator(client, tt.mode, tt.timeoutMinutes)
-			if fo == nil {
+			freezeOrch := NewFreezeOrchestrator(client, tt.mode, tt.timeoutMinutes)
+			if freezeOrch == nil {
 				t.Fatal("NewFreezeOrchestrator returned nil")
 			}
-			if fo.snapshotConsistencyMode != tt.mode {
-				t.Errorf("expected mode %s, got %s", tt.mode, fo.snapshotConsistencyMode)
+			if freezeOrch.snapshotConsistencyMode != tt.mode {
+				t.Errorf("expected mode %s, got %s", tt.mode, freezeOrch.snapshotConsistencyMode)
 			}
-			if fo.freezeWaitTimeoutMinutes != tt.expectedTimeoutMinutes {
-				t.Errorf("expected timeout %d, got %d", tt.expectedTimeoutMinutes, fo.freezeWaitTimeoutMinutes)
+			if freezeOrch.freezeWaitTimeoutMinutes != tt.expectedTimeoutMinutes {
+				t.Errorf("expected timeout %d, got %d", tt.expectedTimeoutMinutes, freezeOrch.freezeWaitTimeoutMinutes)
 			}
-			if fo.ongoingSnapshots == nil {
+			if freezeOrch.ongoingSnapshots == nil {
 				t.Error("ongoingSnapshots map is nil")
 			}
 		})
@@ -82,7 +82,7 @@ func TestNewFreezeOrchestrator(t *testing.T) {
 
 func TestFreezeOrchestrator_CheckOrRequestFreeze(t *testing.T) {
 	client := fake.NewSimpleClientset()
-	fo := NewFreezeOrchestrator(client, "best-effort", 2)
+	freezeOrch := NewFreezeOrchestrator(client, "best-effort", 2)
 
 	snapshotName := "test-snapshot"
 	volumeHandle := "test-volume"
@@ -107,10 +107,10 @@ func TestFreezeOrchestrator_CheckOrRequestFreeze(t *testing.T) {
 		t.Fatalf("failed to create PV: %v", err)
 	}
 
-	// Create VolumeAttachment
-	va := &storagev1.VolumeAttachment{
+	// Create VolumeAttachment without freeze-state annotation
+	vaWithoutState := &storagev1.VolumeAttachment{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "test-va",
+			Name: "test-va-without-state",
 			Annotations: map[string]string{
 				freeze.AnnotationFreezeRequired: time.Now().Format(time.RFC3339),
 			},
@@ -125,13 +125,19 @@ func TestFreezeOrchestrator_CheckOrRequestFreeze(t *testing.T) {
 			Attached: true,
 		},
 	}
-	_, err = client.StorageV1().VolumeAttachments().Create(context.Background(), va, metav1.CreateOptions{})
+	_, err = client.StorageV1().VolumeAttachments().Create(context.Background(), vaWithoutState, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatalf("failed to create VA: %v", err)
 	}
 
+	// Bootstrap VolumeAttachment tracker
+	err = freezeOrch.BootstrapVolumeAttachmentTracking(context.Background())
+	if err != nil {
+		t.Fatalf("failed to bootstrap VolumeAttachment tracking: %v", err)
+	}
+
 	// Test when freeze not complete yet (no freeze-state annotation)
-	state, ready, err := fo.CheckOrRequestFreeze(context.Background(), volumeHandle, snapshotName, "default")
+	state, ready, err := freezeOrch.CheckOrRequestFreeze(context.Background(), volumeHandle, snapshotName, "default")
 	if err != nil {
 		t.Errorf("CheckOrRequestFreeze failed: %v", err)
 	}
@@ -142,14 +148,59 @@ func TestFreezeOrchestrator_CheckOrRequestFreeze(t *testing.T) {
 		t.Error("should not be ready when freeze not complete")
 	}
 
-	// Test with freeze-state annotation
-	va.Annotations[freeze.AnnotationFreezeState] = freeze.FreezeStateFrozen
-	_, err = client.StorageV1().VolumeAttachments().Update(context.Background(), va, metav1.UpdateOptions{})
+	// Create second test - volume with frozen state
+	volume2 := "test-volume-frozen"
+	pvName2 := "test-pv-frozen"
+	pv2 := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: pvName2,
+		},
+		Spec: corev1.PersistentVolumeSpec{
+			VolumeMode: ptr.To(corev1.PersistentVolumeFilesystem),
+			PersistentVolumeSource: corev1.PersistentVolumeSource{
+				CSI: &corev1.CSIPersistentVolumeSource{
+					VolumeHandle: volume2,
+				},
+			},
+		},
+	}
+	_, err = client.CoreV1().PersistentVolumes().Create(context.Background(), pv2, metav1.CreateOptions{})
 	if err != nil {
-		t.Fatalf("failed to update VA: %v", err)
+		t.Fatalf("failed to create second PV: %v", err)
 	}
 
-	state, ready, err = fo.CheckOrRequestFreeze(context.Background(), volumeHandle, snapshotName, "default")
+	vaFrozen := &storagev1.VolumeAttachment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-va-frozen",
+			Annotations: map[string]string{
+				freeze.AnnotationFreezeRequired: time.Now().Format(time.RFC3339),
+				freeze.AnnotationFreezeState:    freeze.FreezeStateFrozen,
+			},
+		},
+		Spec: storagev1.VolumeAttachmentSpec{
+			NodeName: "test-node",
+			Source: storagev1.VolumeAttachmentSource{
+				PersistentVolumeName: &pvName2,
+			},
+		},
+		Status: storagev1.VolumeAttachmentStatus{
+			Attached: true,
+		},
+	}
+	_, err = client.StorageV1().VolumeAttachments().Create(context.Background(), vaFrozen, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("failed to create frozen VA: %v", err)
+	}
+
+	// Re-bootstrap to pick up the new VA
+	fo2 := NewFreezeOrchestrator(client, "best-effort", 2)
+	err = fo2.BootstrapVolumeAttachmentTracking(context.Background())
+	if err != nil {
+		t.Fatalf("failed to bootstrap second orchestrator: %v", err)
+	}
+
+	// Test with freeze-state annotation
+	state, ready, err = fo2.CheckOrRequestFreeze(context.Background(), volume2, snapshotName, "default")
 	if err != nil {
 		t.Errorf("CheckOrRequestFreeze failed: %v", err)
 	}
@@ -221,8 +272,8 @@ func TestFreezeOrchestrator_ShouldProceedWithState(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			client := fake.NewSimpleClientset()
-			fo := NewFreezeOrchestrator(client, tt.mode, 2)
-			result := fo.shouldProceedWithState(tt.freezeState)
+			freezeOrch := NewFreezeOrchestrator(client, tt.mode, 2)
+			result := freezeOrch.shouldProceedWithState(tt.freezeState)
 			if result != tt.expectedResult {
 				t.Errorf("expected %v, got %v", tt.expectedResult, result)
 			}
@@ -232,7 +283,7 @@ func TestFreezeOrchestrator_ShouldProceedWithState(t *testing.T) {
 
 func TestFreezeOrchestrator_TrackingOperations(t *testing.T) {
 	client := fake.NewSimpleClientset()
-	fo := NewFreezeOrchestrator(client, "best-effort", 2)
+	freezeOrch := NewFreezeOrchestrator(client, "best-effort", 2)
 
 	snapshotName := "test-snapshot"
 	tracking := &snapshotTracking{
@@ -243,10 +294,10 @@ func TestFreezeOrchestrator_TrackingOperations(t *testing.T) {
 	}
 
 	// Add tracking
-	fo.addTracking(snapshotName, tracking)
+	freezeOrch.addTracking(snapshotName, tracking)
 
 	// Get tracking
-	got, exists := fo.getTracking(snapshotName)
+	got, exists := freezeOrch.getTracking(snapshotName)
 	if !exists {
 		t.Error("tracking should exist")
 	}
@@ -255,10 +306,10 @@ func TestFreezeOrchestrator_TrackingOperations(t *testing.T) {
 	}
 
 	// Remove tracking
-	fo.removeTracking(snapshotName, tracking.volumeHandle)
+	freezeOrch.removeTracking(snapshotName, tracking.volumeHandle)
 
 	// Verify removed
-	_, exists = fo.getTracking(snapshotName)
+	_, exists = freezeOrch.getTracking(snapshotName)
 	if exists {
 		t.Error("tracking should be removed")
 	}
@@ -266,38 +317,38 @@ func TestFreezeOrchestrator_TrackingOperations(t *testing.T) {
 
 func TestFreezeOrchestrator_HasOtherSnapshotsForVolume(t *testing.T) {
 	client := fake.NewSimpleClientset()
-	fo := NewFreezeOrchestrator(client, "best-effort", 2)
+	freezeOrch := NewFreezeOrchestrator(client, "best-effort", 2)
 
 	volumeHandle := "test-volume"
 	snapshot1 := "snapshot-1"
 	snapshot2 := "snapshot-2"
 
 	// Add first snapshot
-	fo.addTracking(snapshot1, &snapshotTracking{
+	freezeOrch.addTracking(snapshot1, &snapshotTracking{
 		volumeHandle: volumeHandle,
 		snapshotName: snapshot1,
 	})
 
 	// Check when only one snapshot exists
-	result := fo.hasOtherSnapshotsForVolume(volumeHandle, snapshot1)
+	result := freezeOrch.hasOtherSnapshotsForVolume(volumeHandle, snapshot1)
 	if result {
 		t.Error("should not have other snapshots")
 	}
 
 	// Add second snapshot
-	fo.addTracking(snapshot2, &snapshotTracking{
+	freezeOrch.addTracking(snapshot2, &snapshotTracking{
 		volumeHandle: volumeHandle,
 		snapshotName: snapshot2,
 	})
 
 	// Check when two snapshots exist
-	result = fo.hasOtherSnapshotsForVolume(volumeHandle, snapshot1)
+	result = freezeOrch.hasOtherSnapshotsForVolume(volumeHandle, snapshot1)
 	if !result {
 		t.Error("should have other snapshots")
 	}
 
 	// Check with different volume
-	result = fo.hasOtherSnapshotsForVolume("different-volume", snapshot1)
+	result = freezeOrch.hasOtherSnapshotsForVolume("different-volume", snapshot1)
 	if result {
 		t.Error("should not have snapshots for different volume")
 	}
@@ -305,7 +356,7 @@ func TestFreezeOrchestrator_HasOtherSnapshotsForVolume(t *testing.T) {
 
 func TestFreezeOrchestrator_GetPVFromVolumeHandle(t *testing.T) {
 	client := fake.NewSimpleClientset()
-	fo := NewFreezeOrchestrator(client, "best-effort", 2)
+	freezeOrch := NewFreezeOrchestrator(client, "best-effort", 2)
 
 	volumeHandle := "test-volume-handle"
 	pvName := "test-pv"
@@ -329,7 +380,7 @@ func TestFreezeOrchestrator_GetPVFromVolumeHandle(t *testing.T) {
 	}
 
 	// Test successful lookup
-	foundPV, err := fo.getPVFromVolumeHandle(context.Background(), volumeHandle)
+	foundPV, err := freezeOrch.getPVFromVolumeHandle(context.Background(), volumeHandle)
 	if err != nil {
 		t.Errorf("getPVFromVolumeHandle failed: %v", err)
 	}
@@ -338,7 +389,7 @@ func TestFreezeOrchestrator_GetPVFromVolumeHandle(t *testing.T) {
 	}
 
 	// Test with non-existent volume handle
-	_, err = fo.getPVFromVolumeHandle(context.Background(), "non-existent")
+	_, err = freezeOrch.getPVFromVolumeHandle(context.Background(), "non-existent")
 	if err == nil {
 		t.Error("expected error for non-existent volume handle")
 	}
@@ -346,86 +397,143 @@ func TestFreezeOrchestrator_GetPVFromVolumeHandle(t *testing.T) {
 
 func TestFreezeOrchestrator_IsVolumeAttached(t *testing.T) {
 	client := fake.NewSimpleClientset()
-	fo := NewFreezeOrchestrator(client, "best-effort", 2)
 
-	volumeHandle := "test-volume"
-	pvName := "test-pv"
-
-	// Create PV
-	pv := &corev1.PersistentVolume{
+	// Volume 1: No VolumeAttachment (not attached)
+	volumeHandle1 := "test-volume-no-va"
+	pvName1 := "test-pv-no-va"
+	pv1 := &corev1.PersistentVolume{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: pvName,
+			Name: pvName1,
 		},
 		Spec: corev1.PersistentVolumeSpec{
 			PersistentVolumeSource: corev1.PersistentVolumeSource{
 				CSI: &corev1.CSIPersistentVolumeSource{
-					VolumeHandle: volumeHandle,
+					VolumeHandle: volumeHandle1,
 				},
 			},
 		},
 	}
-	_, err := client.CoreV1().PersistentVolumes().Create(context.Background(), pv, metav1.CreateOptions{})
+	_, err := client.CoreV1().PersistentVolumes().Create(context.Background(), pv1, metav1.CreateOptions{})
 	if err != nil {
-		t.Fatalf("failed to create PV: %v", err)
+		t.Fatalf("failed to create PV1: %v", err)
 	}
 
-	// Test when not attached
-	va, err := fo.isVolumeAttached(context.Background(), volumeHandle)
-	if err != nil {
-		t.Fatalf("isVolumeAttached failed: %v", err)
-	}
-	if va != nil {
-		t.Error("volume should not be attached")
-	}
-
-	// Create attached VolumeAttachment
-	vaToCreate := &storagev1.VolumeAttachment{
+	// Volume 2: VolumeAttachment with Attached=true
+	volumeHandle2 := "test-volume-attached"
+	pvName2 := "test-pv-attached"
+	pv2 := &corev1.PersistentVolume{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "test-va",
+			Name: pvName2,
+		},
+		Spec: corev1.PersistentVolumeSpec{
+			PersistentVolumeSource: corev1.PersistentVolumeSource{
+				CSI: &corev1.CSIPersistentVolumeSource{
+					VolumeHandle: volumeHandle2,
+				},
+			},
+		},
+	}
+	_, err = client.CoreV1().PersistentVolumes().Create(context.Background(), pv2, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("failed to create PV2: %v", err)
+	}
+
+	vaAttached := &storagev1.VolumeAttachment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-va-attached",
 		},
 		Spec: storagev1.VolumeAttachmentSpec{
 			NodeName: "test-node",
 			Source: storagev1.VolumeAttachmentSource{
-				PersistentVolumeName: &pvName,
+				PersistentVolumeName: &pvName2,
 			},
 		},
 		Status: storagev1.VolumeAttachmentStatus{
 			Attached: true,
 		},
 	}
-	_, err = client.StorageV1().VolumeAttachments().Create(context.Background(), vaToCreate, metav1.CreateOptions{})
+	_, err = client.StorageV1().VolumeAttachments().Create(context.Background(), vaAttached, metav1.CreateOptions{})
 	if err != nil {
-		t.Fatalf("failed to create VA: %v", err)
+		t.Fatalf("failed to create attached VA: %v", err)
 	}
 
-	// Test when attached
-	va, err = fo.isVolumeAttached(context.Background(), volumeHandle)
+	// Volume 3: VolumeAttachment with Attached=false
+	volumeHandle3 := "test-volume-not-attached"
+	pvName3 := "test-pv-not-attached"
+	pv3 := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: pvName3,
+		},
+		Spec: corev1.PersistentVolumeSpec{
+			PersistentVolumeSource: corev1.PersistentVolumeSource{
+				CSI: &corev1.CSIPersistentVolumeSource{
+					VolumeHandle: volumeHandle3,
+				},
+			},
+		},
+	}
+	_, err = client.CoreV1().PersistentVolumes().Create(context.Background(), pv3, metav1.CreateOptions{})
 	if err != nil {
-		t.Fatalf("isVolumeAttached failed: %v", err)
+		t.Fatalf("failed to create PV3: %v", err)
+	}
+
+	vaNotAttached := &storagev1.VolumeAttachment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-va-not-attached",
+		},
+		Spec: storagev1.VolumeAttachmentSpec{
+			NodeName: "test-node",
+			Source: storagev1.VolumeAttachmentSource{
+				PersistentVolumeName: &pvName3,
+			},
+		},
+		Status: storagev1.VolumeAttachmentStatus{
+			Attached: false,
+		},
+	}
+	_, err = client.StorageV1().VolumeAttachments().Create(context.Background(), vaNotAttached, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("failed to create not-attached VA: %v", err)
+	}
+
+	// Bootstrap VolumeAttachment tracker
+	freezeOrch := NewFreezeOrchestrator(client, "best-effort", 2)
+	err = freezeOrch.BootstrapVolumeAttachmentTracking(context.Background())
+	if err != nil {
+		t.Fatalf("failed to bootstrap VolumeAttachment tracking: %v", err)
+	}
+
+	// Test 1: Volume with no VolumeAttachment
+	va, err := freezeOrch.isVolumeAttached(context.Background(), volumeHandle1)
+	if err != nil {
+		t.Errorf("isVolumeAttached failed for volume1: %v", err)
+	}
+	if va != nil {
+		t.Error("volume1 should not be attached (no VA)")
+	}
+
+	// Test 2: Volume with VolumeAttachment.Status.Attached=true
+	va, err = freezeOrch.isVolumeAttached(context.Background(), volumeHandle2)
+	if err != nil {
+		t.Errorf("isVolumeAttached failed for volume2: %v", err)
 	}
 	if va == nil || !va.Status.Attached {
-		t.Error("volume should be attached")
+		t.Error("volume2 should be attached")
 	}
 
-	// Test when VA not attached
-	vaToCreate.Status.Attached = false
-	_, err = client.StorageV1().VolumeAttachments().Update(context.Background(), vaToCreate, metav1.UpdateOptions{})
+	// Test 3: Volume with VolumeAttachment.Status.Attached=false
+	va, err = freezeOrch.isVolumeAttached(context.Background(), volumeHandle3)
 	if err != nil {
-		t.Fatalf("failed to update VA: %v", err)
-	}
-
-	va, err = fo.isVolumeAttached(context.Background(), volumeHandle)
-	if err != nil {
-		t.Fatalf("isVolumeAttached failed: %v", err)
+		t.Errorf("isVolumeAttached failed for volume3: %v", err)
 	}
 	if va != nil && va.Status.Attached {
-		t.Error("volume should not be attached when VA status is false")
+		t.Error("volume3 should not be attached when VA status is false")
 	}
 }
 
 func TestFreezeOrchestrator_SetAndRemoveFreezeRequiredAnnotation(t *testing.T) {
 	client := fake.NewSimpleClientset()
-	fo := NewFreezeOrchestrator(client, "best-effort", 2)
+	freezeOrch := NewFreezeOrchestrator(client, "best-effort", 2)
 
 	pvName := "test-pv"
 	va := &storagev1.VolumeAttachment{
@@ -448,7 +556,7 @@ func TestFreezeOrchestrator_SetAndRemoveFreezeRequiredAnnotation(t *testing.T) {
 
 	// Set freeze-required annotation
 	freezeTime := time.Now()
-	err = fo.setFreezeRequiredAnnotation(context.Background(), va, freezeTime)
+	err = freezeOrch.setFreezeRequiredAnnotation(context.Background(), va, freezeTime)
 	if err != nil {
 		t.Errorf("setFreezeRequiredAnnotation failed: %v", err)
 	}
@@ -463,7 +571,7 @@ func TestFreezeOrchestrator_SetAndRemoveFreezeRequiredAnnotation(t *testing.T) {
 	}
 
 	// Remove freeze-required annotation
-	err = fo.removeFreezeRequiredAnnotation(context.Background(), updated)
+	err = freezeOrch.removeFreezeRequiredAnnotation(context.Background(), updated)
 	if err != nil {
 		t.Errorf("removeFreezeRequiredAnnotation failed: %v", err)
 	}
@@ -562,32 +670,32 @@ func TestDriver_GetFreezeOrchestrator(t *testing.T) {
 		),
 	}
 
-	fo := d.getFreezeOrchestrator()
-	if fo == nil {
+	freezeOrch := d.getFreezeOrchestrator()
+	if freezeOrch == nil {
 		t.Fatal("getFreezeOrchestrator returned nil")
 	}
-	if fo.snapshotConsistencyMode != "best-effort" {
-		t.Errorf("expected mode best-effort, got %s", fo.snapshotConsistencyMode)
+	if freezeOrch.snapshotConsistencyMode != "best-effort" {
+		t.Errorf("expected mode best-effort, got %s", freezeOrch.snapshotConsistencyMode)
 	}
 
 	// Test without freeze orchestrator
 	d.freezeOrchestrator = nil
-	fo = d.getFreezeOrchestrator()
-	if fo != nil {
+	freezeOrch = d.getFreezeOrchestrator()
+	if freezeOrch != nil {
 		t.Error("getFreezeOrchestrator should return nil when not initialized")
 	}
 }
 
 func TestFreezeOrchestrator_EdgeCases(t *testing.T) {
 	client := fake.NewSimpleClientset()
-	fo := NewFreezeOrchestrator(client, "best-effort", 2)
+	freezeOrch := NewFreezeOrchestrator(client, "best-effort", 2)
 
 	ctx := context.Background()
 	volumeHandle := "test-volume"
 	snapshotName := "test-snapshot"
 
 	// Test with non-existent PV - should skip freeze gracefully
-	_, ready, err := fo.CheckOrRequestFreeze(ctx, volumeHandle, snapshotName, "")
+	_, ready, err := freezeOrch.CheckOrRequestFreeze(ctx, volumeHandle, snapshotName, "")
 	if err != nil {
 		t.Errorf("CheckOrRequestFreeze should not error when PV doesn't exist: %v", err)
 	}
@@ -616,7 +724,7 @@ func TestFreezeOrchestrator_EdgeCases(t *testing.T) {
 	}
 
 	// Test with block mode volume - should skip freeze and proceed
-	_, ready, err = fo.CheckOrRequestFreeze(ctx, volumeHandle, snapshotName, "")
+	_, ready, err = freezeOrch.CheckOrRequestFreeze(ctx, volumeHandle, snapshotName, "")
 	if err != nil {
 		t.Errorf("CheckOrRequestFreeze should not error for block volume: %v", err)
 	}
@@ -656,9 +764,9 @@ func TestFreezeOrchestrator_HasTimedOut(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			client := fake.NewSimpleClientset()
-			fo := NewFreezeOrchestrator(client, "test-driver", tt.timeoutMinutes)
+			freezeOrch := NewFreezeOrchestrator(client, "test-driver", tt.timeoutMinutes)
 
-			result := fo.hasTimedOut(tt.freezeTime)
+			result := freezeOrch.hasTimedOut(tt.freezeTime)
 			if result != tt.expectedValue {
 				t.Errorf("hasTimedOut() = %v, want %v", result, tt.expectedValue)
 			}
@@ -671,7 +779,7 @@ func TestFreezeOrchestrator_SetRemoveFreezeRequiredAnnotationDetails(t *testing.
 	ctx := context.Background()
 	client := fake.NewSimpleClientset()
 	driverName := "disk.csi.azure.com"
-	fo := NewFreezeOrchestrator(client, driverName, 30)
+	freezeOrch := NewFreezeOrchestrator(client, driverName, 30)
 
 	volumeHandle := "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/disks/test-disk"
 	pvName := "test-pv"
@@ -717,7 +825,7 @@ func TestFreezeOrchestrator_SetRemoveFreezeRequiredAnnotationDetails(t *testing.
 
 	// Test setFreezeRequiredAnnotation
 	freezeTime := time.Now()
-	err = fo.setFreezeRequiredAnnotation(ctx, va, freezeTime)
+	err = freezeOrch.setFreezeRequiredAnnotation(ctx, va, freezeTime)
 	if err != nil {
 		t.Fatalf("setFreezeRequiredAnnotation failed: %v", err)
 	}
@@ -732,7 +840,7 @@ func TestFreezeOrchestrator_SetRemoveFreezeRequiredAnnotationDetails(t *testing.
 	}
 
 	// Test removeFreezeRequiredAnnotation
-	err = fo.removeFreezeRequiredAnnotation(ctx, va)
+	err = freezeOrch.removeFreezeRequiredAnnotation(ctx, va)
 	if err != nil {
 		t.Fatalf("removeFreezeRequiredAnnotation failed: %v", err)
 	}
@@ -843,7 +951,7 @@ func TestDriver_LogFreezeEvent(t *testing.T) {
 // TestFreezeOrchestrator_ReleaseFreeze tests the full release flow
 func TestFreezeOrchestrator_ReleaseFreeze(t *testing.T) {
 	client := fake.NewSimpleClientset()
-	fo := NewFreezeOrchestrator(client, "best-effort", 2)
+	freezeOrch := NewFreezeOrchestrator(client, "best-effort", 2)
 
 	ctx := context.Background()
 	volumeHandle := "test-volume"
@@ -893,7 +1001,7 @@ func TestFreezeOrchestrator_ReleaseFreeze(t *testing.T) {
 	}
 
 	// Add tracking
-	fo.addTracking(snapshotName, &snapshotTracking{
+	freezeOrch.addTracking(snapshotName, &snapshotTracking{
 		volumeHandle:         volumeHandle,
 		snapshotName:         snapshotName,
 		snapshotNamespace:    "default",
@@ -902,7 +1010,7 @@ func TestFreezeOrchestrator_ReleaseFreeze(t *testing.T) {
 	})
 
 	t.Run("ReleaseFreeze removes annotation when no other snapshots", func(t *testing.T) {
-		err := fo.ReleaseFreeze(ctx, volumeHandle, snapshotName, "default")
+		err := freezeOrch.ReleaseFreeze(ctx, volumeHandle, snapshotName, "default")
 		if err != nil {
 			t.Errorf("ReleaseFreeze failed: %v", err)
 		}
@@ -918,7 +1026,7 @@ func TestFreezeOrchestrator_ReleaseFreeze(t *testing.T) {
 		}
 
 		// Verify tracking was removed
-		_, exists := fo.getTracking(snapshotName)
+		_, exists := freezeOrch.getTracking(snapshotName)
 		if exists {
 			t.Error("tracking should have been removed")
 		}
@@ -926,7 +1034,7 @@ func TestFreezeOrchestrator_ReleaseFreeze(t *testing.T) {
 
 	t.Run("ReleaseFreeze keeps annotation when other snapshots exist", func(t *testing.T) {
 		// Re-add tracking for snapshot1
-		fo.addTracking("snapshot1", &snapshotTracking{
+		freezeOrch.addTracking("snapshot1", &snapshotTracking{
 			volumeHandle:         volumeHandle,
 			snapshotName:         "snapshot1",
 			snapshotNamespace:    "default",
@@ -935,7 +1043,7 @@ func TestFreezeOrchestrator_ReleaseFreeze(t *testing.T) {
 		})
 
 		// Add tracking for snapshot2 (other snapshot)
-		fo.addTracking("snapshot2", &snapshotTracking{
+		freezeOrch.addTracking("snapshot2", &snapshotTracking{
 			volumeHandle:         volumeHandle,
 			snapshotName:         "snapshot2",
 			snapshotNamespace:    "default",
@@ -951,7 +1059,7 @@ func TestFreezeOrchestrator_ReleaseFreeze(t *testing.T) {
 		}
 
 		// Release snapshot1
-		err = fo.ReleaseFreeze(ctx, volumeHandle, "snapshot1", "default")
+		err = freezeOrch.ReleaseFreeze(ctx, volumeHandle, "snapshot1", "default")
 		if err != nil {
 			t.Errorf("ReleaseFreeze failed: %v", err)
 		}
@@ -967,13 +1075,13 @@ func TestFreezeOrchestrator_ReleaseFreeze(t *testing.T) {
 		}
 
 		// Verify snapshot1 tracking was removed
-		_, exists := fo.getTracking("snapshot1")
+		_, exists := freezeOrch.getTracking("snapshot1")
 		if exists {
 			t.Error("snapshot1 tracking should have been removed")
 		}
 
 		// Verify snapshot2 tracking still exists
-		_, exists = fo.getTracking("snapshot2")
+		_, exists = freezeOrch.getTracking("snapshot2")
 		if !exists {
 			t.Error("snapshot2 tracking should still exist")
 		}

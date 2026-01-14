@@ -316,7 +316,7 @@ func (w *VolumeAttachmentWatcher) processUnfreeze(ctx context.Context, va *stora
 	err = w.freezeManager.Unfreeze(ctx, mountPath, volumeUUID)
 
 	if err != nil {
-		// Critical event as unfreeze failure wont be visible from controller
+		// Critical event as unfreeze failure won't be visible from controller
 		w.sendEvent(va, corev1.EventTypeWarning, EventReasonUnfreezeFailed,
 			fmt.Sprintf("Failed to unfreeze filesystem at %s: %v", mountPath, err))
 		// Don't remove annotation on failure - needs manual intervention

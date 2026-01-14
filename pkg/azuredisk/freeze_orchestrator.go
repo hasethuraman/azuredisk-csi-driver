@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	snapshotclientset "github.com/kubernetes-csi/external-snapshotter/client/v4/clientset/versioned"
@@ -31,7 +32,9 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/pager"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/lru"
@@ -74,8 +77,18 @@ type FreezeOrchestrator struct {
 	skipFreezeCache *lru.Cache
 	skipFreezeMu    sync.RWMutex
 
+	// VolumeAttachment tracking
+	// Maps volumeHandle -> *storagev1.VolumeAttachment
+	volumeAttachments   map[string]*storagev1.VolumeAttachment
+	volumeAttachmentsMu sync.RWMutex
+	informerFactory     informers.SharedInformerFactory
+	informerStopCh      chan struct{}
+	informerStopChMu    sync.Mutex
+
 	// Bootstrap state tracking
-	bootstrapComplete bool
+	bootstrapComplete    bool
+	vaTrackerInitialized atomic.Bool
+	vaTrackerInitFailed  atomic.Bool
 }
 
 type snapshotTracking struct {
@@ -96,7 +109,7 @@ func NewFreezeOrchestrator(
 		freezeWaitTimeoutMinutes = azureconstants.DefaultFreezeWaitTimeoutMinutes
 	}
 
-	fo := &FreezeOrchestrator{
+	freezeOrch := &FreezeOrchestrator{
 		kubeClient:               kubeClient,
 		snapshotClient:           nil, // Will be set by driver if available
 		snapshotConsistencyMode:  snapshotConsistencyMode,
@@ -105,18 +118,20 @@ func NewFreezeOrchestrator(
 		volumeLocks:              make(map[string]*sync.Mutex),
 		skipFreezeCache:          lru.New(maxSkipFreezeCacheSize),
 		bootstrapComplete:        false,
+		volumeAttachments:        make(map[string]*storagev1.VolumeAttachment),
+		// vaTrackerInitialized defaults to false (atomic.Bool zero value)
 	}
 
-	return fo
+	return freezeOrch
 }
 
 // SetSnapshotClient sets the snapshot client
-func (fo *FreezeOrchestrator) SetSnapshotClient(snapshotClient snapshotclientset.Interface) {
-	fo.snapshotClient = snapshotClient
+func (freezeOrch *FreezeOrchestrator) SetSnapshotClient(snapshotClient snapshotclientset.Interface) {
+	freezeOrch.snapshotClient = snapshotClient
 }
 
-func (fo *FreezeOrchestrator) isSnapshotStrictMode() bool {
-	return fo.snapshotConsistencyMode == "strict"
+func (freezeOrch *FreezeOrchestrator) isSnapshotStrictMode() bool {
+	return freezeOrch.snapshotConsistencyMode == "strict"
 }
 
 func (d *Driver) CheckOrRequestFreeze(ctx context.Context, sourceVolumeID, snapshotName string, snapshotNamespace *string) (error, func(bool)) {
@@ -188,22 +203,22 @@ func (d *Driver) CheckOrRequestFreeze(ctx context.Context, sourceVolumeID, snaps
 // - freezeState: current state ("", "frozen", "skipped", etc.)
 // - isReadyToSnapshot: true if snapshot can proceed, false if need to wait
 // for best effort we set isReadyToSnapshot to true even if freeze failed
-func (fo *FreezeOrchestrator) CheckOrRequestFreeze(ctx context.Context, volumeHandle string, snapshotName string, snapshotNamespace string) (string, bool, error) {
+func (freezeOrch *FreezeOrchestrator) CheckOrRequestFreeze(ctx context.Context, volumeHandle string, snapshotName string, snapshotNamespace string) (string, bool, error) {
 	klog.V(4).Infof("CheckOrRequestFreeze: volume %s snapshot %s", volumeHandle, snapshotName)
 
 	// Check if this volume is in the skip list (cached from previous checks)
-	if fo.shouldSkipFreezeFromCache(volumeHandle) {
+	if freezeOrch.shouldSkipFreezeFromCache(volumeHandle) {
 		klog.V(4).Infof("CheckOrRequestFreeze: volume %s found in skip freeze cache, skipping freeze", volumeHandle)
 		return "", true, nil
 	}
 
 	// Acquire volume-level lock at the beginning to serialize all operations for this volume
-	volumeLock := fo.getVolumeLock(volumeHandle)
+	volumeLock := freezeOrch.getVolumeLock(volumeHandle)
 	volumeLock.Lock()
 	defer volumeLock.Unlock()
 
 	// Check if we already have tracking for this snapshot (retry case)
-	tracking, exists := fo.getTracking(snapshotName)
+	tracking, exists := freezeOrch.getTracking(snapshotName)
 	var targetVA *storagev1.VolumeAttachment
 	var err error
 
@@ -211,12 +226,12 @@ func (fo *FreezeOrchestrator) CheckOrRequestFreeze(ctx context.Context, volumeHa
 		// This is a retry - we already validated it's a filesystem volume
 		// Skip PV lookup and get VolumeAttachment directly
 		klog.V(4).Infof("CheckOrRequestFreeze: found existing tracking for snapshot %s, using cached VolumeAttachment name", snapshotName)
-		targetVA, err = fo.kubeClient.StorageV1().VolumeAttachments().Get(ctx, tracking.volumeAttachmentName, metav1.GetOptions{})
+		targetVA, err = freezeOrch.kubeClient.StorageV1().VolumeAttachments().Get(ctx, tracking.volumeAttachmentName, metav1.GetOptions{})
 		if err != nil {
 			if apierrors.IsNotFound(err) {
 				// VolumeAttachment not found (404) - volume may have been detached/deleted
 				// Remove tracking and allow snapshot to proceed
-				fo.removeTracking(snapshotName, volumeHandle)
+				freezeOrch.removeTracking(snapshotName, volumeHandle)
 				klog.V(4).Infof("CheckOrRequestFreeze: VolumeAttachment %s not found for snapshot %s, removed tracking and skipping freeze", tracking.volumeAttachmentName, snapshotName)
 				return "", true, nil
 			}
@@ -226,7 +241,7 @@ func (fo *FreezeOrchestrator) CheckOrRequestFreeze(ctx context.Context, volumeHa
 	} else {
 		// First call - need to validate PV and find VolumeAttachment
 		// Get PV to check if it's a filesystem volume
-		pv, err := fo.getPVFromVolumeHandle(ctx, volumeHandle)
+		pv, err := freezeOrch.getPVFromVolumeHandle(ctx, volumeHandle)
 		if err != nil {
 			// PV not found - skip freeze gracefully (volume may be deleted/detached)
 			klog.V(4).Infof("CheckOrRequestFreeze: failed to get PV for volume %s, skipping freeze: %v", volumeHandle, err)
@@ -237,17 +252,17 @@ func (fo *FreezeOrchestrator) CheckOrRequestFreeze(ctx context.Context, volumeHa
 		if pv.Spec.VolumeMode != nil && *pv.Spec.VolumeMode == corev1.PersistentVolumeBlock {
 			klog.V(4).Infof("CheckOrRequestFreeze: volume %s is block mode, skipping freeze", volumeHandle)
 			// Check if this volume uses a SKU that should skip freeze
-			if fo.shouldSkipFreezeBySKU(pv) {
+			if freezeOrch.shouldSkipFreezeBySKU(pv) {
 				klog.V(4).Infof("CheckOrRequestFreeze: volume %s uses a SKU that should skip freeze, adding to cache", volumeHandle)
-				fo.addToSkipFreezeCache(volumeHandle)
+				freezeOrch.addToSkipFreezeCache(volumeHandle)
 			}
 			return "", true, nil
 		}
 
 		// Find VolumeAttachment for this volume
-		targetVA, err = fo.isVolumeAttached(ctx, volumeHandle)
+		targetVA, err = freezeOrch.isVolumeAttached(ctx, volumeHandle)
 		if err != nil {
-			return "", false, fmt.Errorf("failed to list VolumeAttachments: %v", err)
+			return "", false, fmt.Errorf("failed while checking if volume is attached: %v", err)
 		}
 
 		if targetVA == nil {
@@ -267,7 +282,7 @@ func (fo *FreezeOrchestrator) CheckOrRequestFreeze(ctx context.Context, volumeHa
 	// Case 1: No freeze-required annotation - need to set it
 	if freezeRequired == "" {
 		freezeTime := time.Now()
-		if err := fo.setFreezeRequiredAnnotation(ctx, targetVA, freezeTime); err != nil {
+		if err := freezeOrch.setFreezeRequiredAnnotation(ctx, targetVA, freezeTime); err != nil {
 			if apierrors.IsNotFound(err) {
 				// VolumeAttachment not found (404) - volume may have been detached/deleted
 				klog.V(4).Infof("CheckOrRequestFreeze: VolumeAttachment not found for volume %s, skipping freeze", volumeHandle)
@@ -277,10 +292,10 @@ func (fo *FreezeOrchestrator) CheckOrRequestFreeze(ctx context.Context, volumeHa
 		}
 
 		// Set freeze-required annotation on VolumeSnapshot
-		if fo.snapshotClient != nil && snapshotNamespace != "" {
-			if err := fo.setFreezeRequiredAnnotationOnSnapshot(ctx, snapshotName, snapshotNamespace, freezeTime); err != nil {
+		if freezeOrch.snapshotClient != nil && snapshotNamespace != "" {
+			if err := freezeOrch.setFreezeRequiredAnnotationOnSnapshot(ctx, snapshotName, snapshotNamespace, freezeTime); err != nil {
 				// Rollback VolumeAttachment annotation
-				fo.removeFreezeRequiredAnnotation(ctx, targetVA)
+				freezeOrch.removeFreezeRequiredAnnotation(ctx, targetVA)
 				if apierrors.IsNotFound(err) {
 					// VolumeAttachment not found (404) - volume may have been detached/deleted
 					klog.V(4).Infof("CheckOrRequestFreeze: VolumeSnapshot %s not found for volume %s, skipping freeze", snapshotName, volumeHandle)
@@ -291,7 +306,7 @@ func (fo *FreezeOrchestrator) CheckOrRequestFreeze(ctx context.Context, volumeHa
 		}
 
 		// Track this snapshot (within volume lock scope)
-		fo.addTracking(snapshotName, &snapshotTracking{
+		freezeOrch.addTracking(snapshotName, &snapshotTracking{
 			volumeHandle:         volumeHandle,
 			snapshotName:         snapshotName,
 			snapshotNamespace:    snapshotNamespace,
@@ -312,10 +327,10 @@ func (fo *FreezeOrchestrator) CheckOrRequestFreeze(ctx context.Context, volumeHa
 			freezeTime = time.Now()
 		}
 
-		if fo.hasTimedOut(freezeTime) {
+		if freezeOrch.hasTimedOut(freezeTime) {
 			klog.Warningf("CheckOrRequestFreeze: freeze timed out for snapshot %s", snapshotName)
 			// In strict mode, this is an error; in best-effort, proceed
-			if fo.isSnapshotStrictMode() {
+			if freezeOrch.isSnapshotStrictMode() {
 				return freeze.FreezeStateSkipped, false, fmt.Errorf("freeze operation timed out in strict mode")
 			}
 			return freeze.FreezeStateSkipped, true, nil
@@ -329,16 +344,16 @@ func (fo *FreezeOrchestrator) CheckOrRequestFreeze(ctx context.Context, volumeHa
 	klog.V(2).Infof("CheckOrRequestFreeze: freeze state for snapshot %s: %s", snapshotName, freezeState)
 
 	// Copy freeze-state annotation to VolumeSnapshot (but never remove it)
-	if fo.snapshotClient != nil && snapshotNamespace != "" {
-		if err := fo.setFreezeStateAnnotationOnSnapshot(ctx, snapshotName, snapshotNamespace, freezeState); err != nil {
+	if freezeOrch.snapshotClient != nil && snapshotNamespace != "" {
+		if err := freezeOrch.setFreezeStateAnnotationOnSnapshot(ctx, snapshotName, snapshotNamespace, freezeState); err != nil {
 			klog.Warningf("CheckOrRequestFreeze: failed to set freeze-state annotation on VolumeSnapshot: %v", err)
 			// Not a fatal error - continue with snapshot
 		}
 	}
 
-	shouldProceed := fo.shouldProceedWithState(freezeState)
+	shouldProceed := freezeOrch.shouldProceedWithState(freezeState)
 
-	if !shouldProceed && fo.isSnapshotStrictMode() {
+	if !shouldProceed && freezeOrch.isSnapshotStrictMode() {
 		return freezeState, false, fmt.Errorf("freeze failed with state %s in strict mode", freezeState)
 	}
 
@@ -346,17 +361,17 @@ func (fo *FreezeOrchestrator) CheckOrRequestFreeze(ctx context.Context, volumeHa
 }
 
 // hasTimedOut checks if freeze request has timed out
-func (fo *FreezeOrchestrator) hasTimedOut(freezeTime time.Time) bool {
+func (freezeOrch *FreezeOrchestrator) hasTimedOut(freezeTime time.Time) bool {
 	var timeout time.Duration
-	if fo.isSnapshotStrictMode() {
-		if fo.freezeWaitTimeoutMinutes == 0 {
+	if freezeOrch.isSnapshotStrictMode() {
+		if freezeOrch.freezeWaitTimeoutMinutes == 0 {
 			// Indefinite wait for strict mode with 0 timeout
 			return false
 		}
-		timeout = time.Duration(fo.freezeWaitTimeoutMinutes) * time.Minute
+		timeout = time.Duration(freezeOrch.freezeWaitTimeoutMinutes) * time.Minute
 	} else {
 		// best-effort mode
-		waitTime := fo.freezeWaitTimeoutMinutes
+		waitTime := freezeOrch.freezeWaitTimeoutMinutes
 		if waitTime < 2 {
 			waitTime = 2
 		}
@@ -367,68 +382,68 @@ func (fo *FreezeOrchestrator) hasTimedOut(freezeTime time.Time) bool {
 }
 
 // ReleaseFreeze removes the freeze-required annotation to trigger unfreeze
-func (fo *FreezeOrchestrator) ReleaseFreeze(ctx context.Context, volumeHandle string, snapshotName string, snapshotNamespace string) error {
+func (freezeOrch *FreezeOrchestrator) ReleaseFreeze(ctx context.Context, volumeHandle string, snapshotName string, snapshotNamespace string) error {
 	// Acquire volume-level lock at the highest level using volumeHandle
-	volumeLock := fo.getVolumeLock(volumeHandle)
+	volumeLock := freezeOrch.getVolumeLock(volumeHandle)
 	volumeLock.Lock()
 	defer volumeLock.Unlock()
 
-	tracking, exists := fo.getTracking(snapshotName)
+	tracking, exists := freezeOrch.getTracking(snapshotName)
 	if !exists {
 		klog.V(4).Infof("ReleaseFreeze: no tracking found for snapshot %s", snapshotName)
 		return nil
 	}
 
 	// Get VolumeAttachment
-	va, err := fo.kubeClient.StorageV1().VolumeAttachments().Get(ctx, tracking.volumeAttachmentName, metav1.GetOptions{})
+	va, err := freezeOrch.kubeClient.StorageV1().VolumeAttachments().Get(ctx, tracking.volumeAttachmentName, metav1.GetOptions{})
 	if err != nil {
 		klog.Warningf("ReleaseFreeze: failed to get VolumeAttachment %s: %v", tracking.volumeAttachmentName, err)
-		fo.removeTracking(snapshotName, volumeHandle)
+		freezeOrch.removeTracking(snapshotName, volumeHandle)
 		return nil // Not a fatal error
 	}
 
 	// Check if there are other ongoing snapshots for this volume
-	otherSnapshots := fo.hasOtherSnapshotsForVolume(volumeHandle, snapshotName)
+	otherSnapshots := freezeOrch.hasOtherSnapshotsForVolume(volumeHandle, snapshotName)
 	if otherSnapshots {
 		klog.V(2).Infof("ReleaseFreeze: other snapshots exist for volume %s, not removing freeze-required annotation yet", volumeHandle)
-		fo.removeTracking(snapshotName, volumeHandle)
+		freezeOrch.removeTracking(snapshotName, volumeHandle)
 		return nil
 	}
 
 	// Remove freeze-required annotation from VolumeAttachment
-	if err := fo.removeFreezeRequiredAnnotation(ctx, va); err != nil {
+	if err := freezeOrch.removeFreezeRequiredAnnotation(ctx, va); err != nil {
 		klog.Errorf("ReleaseFreeze: failed to remove freeze-required annotation from VolumeAttachment: %v", err)
-		fo.removeTracking(snapshotName, volumeHandle)
+		freezeOrch.removeTracking(snapshotName, volumeHandle)
 		return err
 	}
 
-	fo.removeTracking(snapshotName, volumeHandle)
+	freezeOrch.removeTracking(snapshotName, volumeHandle)
 
 	klog.V(2).Infof("ReleaseFreeze: released freeze for snapshot %s on VA %s", snapshotName, tracking.volumeAttachmentName)
 	return nil
 }
 
 // setFreezeRequiredAnnotation sets the freeze-required annotation on VolumeAttachment
-func (fo *FreezeOrchestrator) setFreezeRequiredAnnotation(ctx context.Context, va *storagev1.VolumeAttachment, freezeTime time.Time) error {
+func (freezeOrch *FreezeOrchestrator) setFreezeRequiredAnnotation(ctx context.Context, va *storagev1.VolumeAttachment, freezeTime time.Time) error {
 	vaCopy := va.DeepCopy()
 	if vaCopy.Annotations == nil {
 		vaCopy.Annotations = make(map[string]string)
 	}
 	vaCopy.Annotations[freeze.AnnotationFreezeRequired] = freezeTime.Format(time.RFC3339)
 
-	_, err := fo.kubeClient.StorageV1().VolumeAttachments().Update(ctx, vaCopy, metav1.UpdateOptions{})
+	_, err := freezeOrch.kubeClient.StorageV1().VolumeAttachments().Update(ctx, vaCopy, metav1.UpdateOptions{})
 	return err
 }
 
 // removeFreezeRequiredAnnotation removes the freeze-required annotation from VolumeAttachment
-func (fo *FreezeOrchestrator) removeFreezeRequiredAnnotation(ctx context.Context, va *storagev1.VolumeAttachment) error {
+func (freezeOrch *FreezeOrchestrator) removeFreezeRequiredAnnotation(ctx context.Context, va *storagev1.VolumeAttachment) error {
 	vaCopy := va.DeepCopy()
 	if vaCopy.Annotations == nil {
 		return nil
 	}
 	delete(vaCopy.Annotations, freeze.AnnotationFreezeRequired)
 
-	_, err := fo.kubeClient.StorageV1().VolumeAttachments().Update(ctx, vaCopy, metav1.UpdateOptions{})
+	_, err := freezeOrch.kubeClient.StorageV1().VolumeAttachments().Update(ctx, vaCopy, metav1.UpdateOptions{})
 	if err != nil && apierrors.IsNotFound(err) {
 		// VolumeAttachment was deleted - not an error for cleanup
 		return nil
@@ -437,12 +452,12 @@ func (fo *FreezeOrchestrator) removeFreezeRequiredAnnotation(ctx context.Context
 }
 
 // setFreezeRequiredAnnotationOnSnapshot sets the freeze-required annotation on VolumeSnapshot
-func (fo *FreezeOrchestrator) setFreezeRequiredAnnotationOnSnapshot(ctx context.Context, snapshotName string, namespace string, freezeTime time.Time) error {
-	if fo.snapshotClient == nil {
+func (freezeOrch *FreezeOrchestrator) setFreezeRequiredAnnotationOnSnapshot(ctx context.Context, snapshotName string, namespace string, freezeTime time.Time) error {
+	if freezeOrch.snapshotClient == nil {
 		return fmt.Errorf("snapshot client not available")
 	}
 
-	snapshot, err := fo.snapshotClient.SnapshotV1().VolumeSnapshots(namespace).Get(ctx, snapshotName, metav1.GetOptions{})
+	snapshot, err := freezeOrch.snapshotClient.SnapshotV1().VolumeSnapshots(namespace).Get(ctx, snapshotName, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to get VolumeSnapshot: %v", err)
 	}
@@ -453,18 +468,18 @@ func (fo *FreezeOrchestrator) setFreezeRequiredAnnotationOnSnapshot(ctx context.
 	}
 	snapshotCopy.Annotations[freeze.AnnotationFreezeRequired] = freezeTime.Format(time.RFC3339)
 
-	_, err = fo.snapshotClient.SnapshotV1().VolumeSnapshots(namespace).Update(ctx, snapshotCopy, metav1.UpdateOptions{})
+	_, err = freezeOrch.snapshotClient.SnapshotV1().VolumeSnapshots(namespace).Update(ctx, snapshotCopy, metav1.UpdateOptions{})
 	return err
 }
 
 // setFreezeStateAnnotationOnSnapshot sets the freeze-state annotation on VolumeSnapshot
 // Note: This annotation is never removed from VolumeSnapshot (unlike VolumeAttachment)
-func (fo *FreezeOrchestrator) setFreezeStateAnnotationOnSnapshot(ctx context.Context, snapshotName string, namespace string, freezeState string) error {
-	if fo.snapshotClient == nil {
+func (freezeOrch *FreezeOrchestrator) setFreezeStateAnnotationOnSnapshot(ctx context.Context, snapshotName string, namespace string, freezeState string) error {
+	if freezeOrch.snapshotClient == nil {
 		return fmt.Errorf("snapshot client not available")
 	}
 
-	snapshot, err := fo.snapshotClient.SnapshotV1().VolumeSnapshots(namespace).Get(ctx, snapshotName, metav1.GetOptions{})
+	snapshot, err := freezeOrch.snapshotClient.SnapshotV1().VolumeSnapshots(namespace).Get(ctx, snapshotName, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to get VolumeSnapshot: %v", err)
 	}
@@ -475,7 +490,7 @@ func (fo *FreezeOrchestrator) setFreezeStateAnnotationOnSnapshot(ctx context.Con
 	}
 	snapshotCopy.Annotations[freeze.AnnotationFreezeState] = freezeState
 
-	_, err = fo.snapshotClient.SnapshotV1().VolumeSnapshots(namespace).Update(ctx, snapshotCopy, metav1.UpdateOptions{})
+	_, err = freezeOrch.snapshotClient.SnapshotV1().VolumeSnapshots(namespace).Update(ctx, snapshotCopy, metav1.UpdateOptions{})
 	if err != nil && apierrors.IsNotFound(err) {
 		return fmt.Errorf("VolumeSnapshot was deleted: %v", err)
 	}
@@ -484,13 +499,13 @@ func (fo *FreezeOrchestrator) setFreezeStateAnnotationOnSnapshot(ctx context.Con
 
 // getPVFromVolumeHandle gets the PV for a given volume handle
 // Uses pagination to handle large clusters efficiently
-func (fo *FreezeOrchestrator) getPVFromVolumeHandle(ctx context.Context, volumeHandle string) (*corev1.PersistentVolume, error) {
+func (freezeOrch *FreezeOrchestrator) getPVFromVolumeHandle(ctx context.Context, volumeHandle string) (*corev1.PersistentVolume, error) {
 	// Note: Kubernetes PV API doesn't support field selectors for spec.csi.volumeHandle
 	// so we need to list and filter. Using pagination for efficiency.
 	var foundPV *corev1.PersistentVolume
 
 	pvPager := pager.New(func(ctx context.Context, opts metav1.ListOptions) (runtime.Object, error) {
-		return fo.kubeClient.CoreV1().PersistentVolumes().List(ctx, opts)
+		return freezeOrch.kubeClient.CoreV1().PersistentVolumes().List(ctx, opts)
 	})
 
 	err := pvPager.EachListItem(ctx, metav1.ListOptions{}, func(obj runtime.Object) error {
@@ -518,79 +533,79 @@ func (fo *FreezeOrchestrator) getPVFromVolumeHandle(ctx context.Context, volumeH
 }
 
 // shouldProceedWithState determines if snapshot should proceed based on freeze state
-func (fo *FreezeOrchestrator) shouldProceedWithState(freezeState string) bool {
+func (freezeOrch *FreezeOrchestrator) shouldProceedWithState(freezeState string) bool {
 	switch freezeState {
 	case freeze.FreezeStateFrozen:
 		return true
 	case freeze.FreezeStateSkipped:
 		// Skipped - proceed in best-effort, fail in strict
-		return fo.snapshotConsistencyMode == "best-effort"
+		return freezeOrch.snapshotConsistencyMode == "best-effort"
 	case freeze.FreezeStateUserFrozen:
 		// User frozen - proceed (assuming user knows what they're doing)
 		return true
 	case freeze.FreezeStateFailed:
 		// Failed - proceed in best-effort, block in strict
-		return fo.snapshotConsistencyMode == "best-effort"
+		return freezeOrch.snapshotConsistencyMode == "best-effort"
 	default:
-		return fo.snapshotConsistencyMode == "best-effort"
+		return freezeOrch.snapshotConsistencyMode == "best-effort"
 	}
 }
 
 // getVolumeLock gets or creates a mutex for a specific volume
-func (fo *FreezeOrchestrator) getVolumeLock(volumeHandle string) *sync.Mutex {
-	fo.volumeLocksMu.Lock()
-	defer fo.volumeLocksMu.Unlock()
+func (freezeOrch *FreezeOrchestrator) getVolumeLock(volumeHandle string) *sync.Mutex {
+	freezeOrch.volumeLocksMu.Lock()
+	defer freezeOrch.volumeLocksMu.Unlock()
 
-	if lock, exists := fo.volumeLocks[volumeHandle]; exists {
+	if lock, exists := freezeOrch.volumeLocks[volumeHandle]; exists {
 		return lock
 	}
 
 	lock := &sync.Mutex{}
-	fo.volumeLocks[volumeHandle] = lock
+	freezeOrch.volumeLocks[volumeHandle] = lock
 	return lock
 }
 
 // addVolumeLock creates a mutex for a specific volume
-func (fo *FreezeOrchestrator) addVolumeLock(volumeHandle string) {
-	fo.volumeLocksMu.Lock()
-	defer fo.volumeLocksMu.Unlock()
+func (freezeOrch *FreezeOrchestrator) addVolumeLock(volumeHandle string) {
+	freezeOrch.volumeLocksMu.Lock()
+	defer freezeOrch.volumeLocksMu.Unlock()
 
-	if _, exists := fo.volumeLocks[volumeHandle]; !exists {
-		fo.volumeLocks[volumeHandle] = &sync.Mutex{}
+	if _, exists := freezeOrch.volumeLocks[volumeHandle]; !exists {
+		freezeOrch.volumeLocks[volumeHandle] = &sync.Mutex{}
 	}
 }
 
 // releaseVolumeLock removes the mutex for a volume if no snapshots are tracked
-func (fo *FreezeOrchestrator) releaseVolumeLock(volumeHandle string) {
-	fo.volumeLocksMu.Lock()
-	defer fo.volumeLocksMu.Unlock()
+func (freezeOrch *FreezeOrchestrator) releaseVolumeLock(volumeHandle string) {
+	freezeOrch.volumeLocksMu.Lock()
+	defer freezeOrch.volumeLocksMu.Unlock()
 
 	// Check if any snapshots are still using this volume
-	fo.mu.RLock()
+	freezeOrch.mu.RLock()
 	hasSnapshots := false
-	for _, tracking := range fo.ongoingSnapshots {
+	for _, tracking := range freezeOrch.ongoingSnapshots {
 		if tracking.volumeHandle == volumeHandle {
 			hasSnapshots = true
 			break
 		}
 	}
-	fo.mu.RUnlock()
+	freezeOrch.mu.RUnlock()
 
 	// Remove lock if no snapshots reference this volume
 	if !hasSnapshots {
-		delete(fo.volumeLocks, volumeHandle)
+		delete(freezeOrch.volumeLocks, volumeHandle)
 	}
 }
 
 // hasOtherSnapshotsForVolume checks if there are other ongoing snapshots for the same volume
 // Caller must hold the volume lock for volumeHandle
-func (fo *FreezeOrchestrator) hasOtherSnapshotsForVolume(volumeHandle string, excludeSnapshot string) bool {
+func (freezeOrch *FreezeOrchestrator) hasOtherSnapshotsForVolume(volumeHandle string, excludeSnapshot string) bool {
 	// Check cache first
-	fo.mu.RLock()
-	defer fo.mu.RUnlock()
+	freezeOrch.mu.RLock()
+	defer freezeOrch.mu.RUnlock()
 
 	hasOther := false
-	for name, tracking := range fo.ongoingSnapshots {
+	for name, tracking := range freezeOrch.ongoingSnapshots {
 		if name != excludeSnapshot && tracking.volumeHandle == volumeHandle {
 			hasOther = true
 			break
@@ -602,56 +617,56 @@ func (fo *FreezeOrchestrator) hasOtherSnapshotsForVolume(volumeHandle string, ex
 
 // addTracking adds snapshot tracking
 // Caller must hold the volume lock for tracking.volumeHandle
-func (fo *FreezeOrchestrator) addTracking(snapshotName string, tracking *snapshotTracking) {
-	fo.mu.Lock()
-	defer fo.mu.Unlock()
+func (freezeOrch *FreezeOrchestrator) addTracking(snapshotName string, tracking *snapshotTracking) {
+	freezeOrch.mu.Lock()
+	defer freezeOrch.mu.Unlock()
 
 	// to ensure if another thread has removed the lock while this one was already waiting on the same
 	// lock reference
-	fo.addVolumeLock(tracking.volumeHandle)
+	freezeOrch.addVolumeLock(tracking.volumeHandle)
 
-	fo.ongoingSnapshots[snapshotName] = tracking
+	freezeOrch.ongoingSnapshots[snapshotName] = tracking
 }
 
 // getTracking gets snapshot tracking
-func (fo *FreezeOrchestrator) getTracking(snapshotName string) (*snapshotTracking, bool) {
-	fo.mu.RLock()
-	defer fo.mu.RUnlock()
-	tracking, exists := fo.ongoingSnapshots[snapshotName]
+func (freezeOrch *FreezeOrchestrator) getTracking(snapshotName string) (*snapshotTracking, bool) {
+	freezeOrch.mu.RLock()
+	defer freezeOrch.mu.RUnlock()
+	tracking, exists := freezeOrch.ongoingSnapshots[snapshotName]
 	return tracking, exists
 }
 
 // removeTracking removes snapshot tracking
 // Caller must hold the volume lock for volumeHandle
-func (fo *FreezeOrchestrator) removeTracking(snapshotName string, volumeHandle string) {
-	fo.mu.Lock()
-	delete(fo.ongoingSnapshots, snapshotName)
-	fo.mu.Unlock()
+func (freezeOrch *FreezeOrchestrator) removeTracking(snapshotName string, volumeHandle string) {
+	freezeOrch.mu.Lock()
+	delete(freezeOrch.ongoingSnapshots, snapshotName)
+	freezeOrch.mu.Unlock()
 
 	// Release volume lock after removing tracking
-	fo.releaseVolumeLock(volumeHandle)
+	freezeOrch.releaseVolumeLock(volumeHandle)
 }
 
 // addToSkipFreezeCache adds a volume to the skip freeze LRU cache
-func (fo *FreezeOrchestrator) addToSkipFreezeCache(volumeHandle string) {
-	fo.skipFreezeMu.Lock()
-	defer fo.skipFreezeMu.Unlock()
+func (freezeOrch *FreezeOrchestrator) addToSkipFreezeCache(volumeHandle string) {
+	freezeOrch.skipFreezeMu.Lock()
+	defer freezeOrch.skipFreezeMu.Unlock()
 
-	fo.skipFreezeCache.Add(volumeHandle, nil)
+	freezeOrch.skipFreezeCache.Add(volumeHandle, nil)
 	klog.V(6).Infof("Added volume %s to skip freeze LRU cache", volumeHandle)
 }
 
 // shouldSkipFreezeFromCache checks if a volume is in the skip freeze LRU cache
-func (fo *FreezeOrchestrator) shouldSkipFreezeFromCache(volumeHandle string) bool {
-	fo.skipFreezeMu.Lock()
-	defer fo.skipFreezeMu.Unlock()
+func (freezeOrch *FreezeOrchestrator) shouldSkipFreezeFromCache(volumeHandle string) bool {
+	freezeOrch.skipFreezeMu.Lock()
+	defer freezeOrch.skipFreezeMu.Unlock()
 
-	_, exists := fo.skipFreezeCache.Get(volumeHandle)
+	_, exists := freezeOrch.skipFreezeCache.Get(volumeHandle)
 	return exists
 }
 
 // shouldSkipFreezeBySKU checks if a volume's SKU should skip freeze
-func (fo *FreezeOrchestrator) shouldSkipFreezeBySKU(pv *corev1.PersistentVolume) bool {
+func (freezeOrch *FreezeOrchestrator) shouldSkipFreezeBySKU(pv *corev1.PersistentVolume) bool {
 	if pv.Spec.CSI == nil || pv.Spec.CSI.VolumeAttributes == nil {
 		return false
 	}
@@ -703,29 +718,30 @@ func getFreezeStateDescription(state string) string {
 }
 
 // isVolumeAttached checks if any VolumeAttachment exists and is attached for the given volume
-func (fo *FreezeOrchestrator) isVolumeAttached(ctx context.Context, volumeHandle string) (*storagev1.VolumeAttachment, error) {
-	pv, err := fo.getPVFromVolumeHandle(ctx, volumeHandle)
-	if err != nil {
-		return nil, err
+// Uses the VolumeAttachment tracker for efficient lookup
+// Returns error if tracker is not initialized to trigger retry
+// Returns nil (no VA found) if tracker initialization failed, allowing fallback without consistency
+func (freezeOrch *FreezeOrchestrator) isVolumeAttached(ctx context.Context, volumeHandle string) (*storagev1.VolumeAttachment, error) {
+	// Check if tracker initialization failed - if so, proceed without freeze
+	if freezeOrch.vaTrackerInitFailed.Load() {
+		klog.V(4).Infof("VolumeAttachment tracker initialization failed, skipping freeze for volume %s", volumeHandle)
+		return nil, nil
 	}
 
-	// Use field selector to efficiently query VolumeAttachments for this specific PV
-	fieldSelector := fmt.Sprintf("spec.source.persistentVolumeName=%s", pv.Name)
-	vaList, err := fo.kubeClient.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{
-		FieldSelector: fieldSelector,
-	})
-	if err != nil {
-		return nil, err
+	// Check if tracker is initialized
+	if !freezeOrch.isVolumeAttachmentTrackerInitialized() {
+		return nil, fmt.Errorf("VolumeAttachment tracker not initialized yet, will retry")
 	}
 
-	// Find the first attached VolumeAttachment
-	for i := range vaList.Items {
-		va := &vaList.Items[i]
-		if va.Status.Attached {
-			return va, nil
-		}
+	// Use tracker for fast lookup
+	va, exists := freezeOrch.getVolumeAttachmentFromTracker(volumeHandle)
+	if !exists {
+		return nil, nil
 	}
-
+	// Return the VA only if it's attached
+	if va.Status.Attached {
+		return va, nil
+	}
 	return nil, nil
 }
 
@@ -773,4 +789,235 @@ func (d *Driver) logFreezeEvent(volumeHandle string, snapshotName string, messag
 	}
 
 	d.eventRecorder.Event(snapshot, eventType, reason, message)
+}
+
+// BootstrapVolumeAttachmentTracking initializes the VolumeAttachment tracker by listing all existing VolumeAttachments
+// This should be called during driver initialization, similar to snapshot tracking bootstrap
+// Uses pagination to handle large clusters efficiently
+func (freezeOrch *FreezeOrchestrator) BootstrapVolumeAttachmentTracking(ctx context.Context) error {
+	if freezeOrch.vaTrackerInitialized.Load() {
+		klog.V(4).Infof("VolumeAttachment tracker already initialized, skipping bootstrap")
+		return nil
+	}
+
+	klog.V(2).Infof("Bootstrapping VolumeAttachment tracking...")
+
+	count := 0
+
+	// Use pager to efficiently list all VolumeAttachments
+	vaPager := pager.New(func(ctx context.Context, opts metav1.ListOptions) (runtime.Object, error) {
+		return freezeOrch.kubeClient.StorageV1().VolumeAttachments().List(ctx, opts)
+	})
+
+	freezeOrch.volumeAttachmentsMu.Lock()
+	defer freezeOrch.volumeAttachmentsMu.Unlock()
+
+	err := vaPager.EachListItem(ctx, metav1.ListOptions{}, func(obj runtime.Object) error {
+		va, ok := obj.(*storagev1.VolumeAttachment)
+		if !ok {
+			return nil
+		}
+
+		if va.Spec.Source.PersistentVolumeName == nil {
+			return nil
+		}
+
+		// Get PV to extract volumeHandle
+		pvName := *va.Spec.Source.PersistentVolumeName
+		pv, err := freezeOrch.kubeClient.CoreV1().PersistentVolumes().Get(ctx, pvName, metav1.GetOptions{})
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				klog.V(4).Infof("PV %s not found for VolumeAttachment %s, skipping", pvName, va.Name)
+				return nil
+			}
+			klog.Warningf("Failed to get PV %s for VolumeAttachment %s: %v", pvName, va.Name, err)
+			return nil
+		}
+
+		if pv.Spec.CSI == nil || pv.Spec.CSI.VolumeHandle == "" {
+			return nil
+		}
+
+		volumeHandle := pv.Spec.CSI.VolumeHandle
+		freezeOrch.volumeAttachments[volumeHandle] = va.DeepCopy()
+		count++
+		return nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("failed to list VolumeAttachments during bootstrap: %v", err)
+	}
+
+	freezeOrch.vaTrackerInitialized.Store(true)
+	klog.V(2).Infof("VolumeAttachment tracking bootstrap complete: tracked %d VolumeAttachments", count)
+	return nil
+}
+
+// StartVolumeAttachmentInformer starts an informer to watch VolumeAttachment resources
+// This should be called after BootstrapVolumeAttachmentTracking
+func (freezeOrch *FreezeOrchestrator) StartVolumeAttachmentInformer(ctx context.Context) error {
+	if !freezeOrch.vaTrackerInitialized.Load() {
+		return fmt.Errorf("VolumeAttachment tracker not initialized, call BootstrapVolumeAttachmentTracking first")
+	}
+
+	klog.V(2).Infof("Starting VolumeAttachment informer...")
+
+	// Create informer factory
+	freezeOrch.informerFactory = informers.NewSharedInformerFactory(freezeOrch.kubeClient, 0)
+	vaInformer := freezeOrch.informerFactory.Storage().V1().VolumeAttachments().Informer()
+
+	// Add event handlers
+	_, err := vaInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			va, ok := obj.(*storagev1.VolumeAttachment)
+			if !ok {
+				return
+			}
+			freezeOrch.handleVolumeAttachmentAdd(ctx, va)
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			va, ok := newObj.(*storagev1.VolumeAttachment)
+			if !ok {
+				return
+			}
+			freezeOrch.handleVolumeAttachmentUpdate(ctx, va)
+		},
+		DeleteFunc: func(obj interface{}) {
+			va, ok := obj.(*storagev1.VolumeAttachment)
+			if !ok {
+				return
+			}
+			freezeOrch.handleVolumeAttachmentDelete(ctx, va)
+		},
+	})
+
+	if err != nil {
+		return fmt.Errorf("failed to add event handler to VolumeAttachment informer: %w", err)
+	}
+
+	// Start informer
+	freezeOrch.informerStopChMu.Lock()
+	freezeOrch.informerStopCh = make(chan struct{})
+	stopCh := freezeOrch.informerStopCh
+	freezeOrch.informerStopChMu.Unlock()
+
+	go freezeOrch.informerFactory.Start(stopCh)
+
+	// Wait for cache sync (this function is already called in a goroutine)
+	klog.V(2).Infof("Waiting for VolumeAttachment informer cache to sync...")
+	if !cache.WaitForCacheSync(stopCh, vaInformer.HasSynced) {
+		// Only close the channel if it hasn't been closed by StopVolumeAttachmentInformer
+		freezeOrch.informerStopChMu.Lock()
+		if freezeOrch.informerStopCh != nil && freezeOrch.informerStopCh == stopCh {
+			close(freezeOrch.informerStopCh)
+			freezeOrch.informerStopCh = nil
+		}
+		freezeOrch.informerStopChMu.Unlock()
+		return fmt.Errorf("failed to sync VolumeAttachment informer cache")
+	}
+
+	klog.V(2).Infof("VolumeAttachment informer started successfully")
+	return nil
+}
+
+// StopVolumeAttachmentInformer stops the VolumeAttachment informer
+func (freezeOrch *FreezeOrchestrator) StopVolumeAttachmentInformer() {
+	freezeOrch.informerStopChMu.Lock()
+	defer freezeOrch.informerStopChMu.Unlock()
+
+	if freezeOrch.informerStopCh != nil {
+		close(freezeOrch.informerStopCh)
+		freezeOrch.informerStopCh = nil
+		klog.V(2).Infof("VolumeAttachment informer stopped")
+	}
+}
+
+// handleVolumeAttachmentAdd handles VolumeAttachment creation events
+func (freezeOrch *FreezeOrchestrator) handleVolumeAttachmentAdd(ctx context.Context, va *storagev1.VolumeAttachment) {
+	if va.Spec.Source.PersistentVolumeName == nil {
+		return
+	}
+
+	// Get PV to extract volumeHandle
+	pvName := *va.Spec.Source.PersistentVolumeName
+	pv, err := freezeOrch.kubeClient.CoreV1().PersistentVolumes().Get(ctx, pvName, metav1.GetOptions{})
+	if err != nil {
+		if !apierrors.IsNotFound(err) {
+			klog.Warningf("Failed to get PV %s for VolumeAttachment %s: %v", pvName, va.Name, err)
+		}
+		return
+	}
+
+	if pv.Spec.CSI == nil || pv.Spec.CSI.VolumeHandle == "" {
+		return
+	}
+
+	volumeHandle := pv.Spec.CSI.VolumeHandle
+
+	freezeOrch.volumeAttachmentsMu.Lock()
+	defer freezeOrch.volumeAttachmentsMu.Unlock()
+
+	freezeOrch.volumeAttachments[volumeHandle] = va.DeepCopy()
+	klog.V(4).Infof("VolumeAttachment %s added to tracker for volume %s", va.Name, volumeHandle)
+}
+
+// handleVolumeAttachmentUpdate handles VolumeAttachment update events
+func (freezeOrch *FreezeOrchestrator) handleVolumeAttachmentUpdate(ctx context.Context, va *storagev1.VolumeAttachment) {
+	// For updates, treat the same as add - just update the tracker
+	freezeOrch.handleVolumeAttachmentAdd(ctx, va)
+}
+
+// handleVolumeAttachmentDelete handles VolumeAttachment deletion events
+func (freezeOrch *FreezeOrchestrator) handleVolumeAttachmentDelete(ctx context.Context, va *storagev1.VolumeAttachment) {
+	if va.Spec.Source.PersistentVolumeName == nil {
+		return
+	}
+
+	// Get PV to extract volumeHandle
+	pvName := *va.Spec.Source.PersistentVolumeName
+	pv, err := freezeOrch.kubeClient.CoreV1().PersistentVolumes().Get(ctx, pvName, metav1.GetOptions{})
+	if err != nil {
+		// PV might be deleted as well, try to find volumeHandle from existing tracker
+		freezeOrch.volumeAttachmentsMu.Lock()
+		defer freezeOrch.volumeAttachmentsMu.Unlock()
+
+		// Search for the VA in our tracker and remove it
+		for volumeHandle, trackedVA := range freezeOrch.volumeAttachments {
+			if trackedVA.Name == va.Name {
+				delete(freezeOrch.volumeAttachments, volumeHandle)
+				klog.V(4).Infof("VolumeAttachment %s removed from tracker for volume %s", va.Name, volumeHandle)
+				return
+			}
+		}
+		return
+	}
+
+	if pv.Spec.CSI == nil || pv.Spec.CSI.VolumeHandle == "" {
+		return
+	}
+
+	volumeHandle := pv.Spec.CSI.VolumeHandle
+
+	freezeOrch.volumeAttachmentsMu.Lock()
+	defer freezeOrch.volumeAttachmentsMu.Unlock()
+
+	delete(freezeOrch.volumeAttachments, volumeHandle)
+	klog.V(4).Infof("VolumeAttachment %s removed from tracker for volume %s", va.Name, volumeHandle)
+}
+
+// getVolumeAttachmentFromTracker retrieves a VolumeAttachment from the tracker by volumeHandle
+func (freezeOrch *FreezeOrchestrator) getVolumeAttachmentFromTracker(volumeHandle string) (*storagev1.VolumeAttachment, bool) {
+	freezeOrch.volumeAttachmentsMu.RLock()
+	defer freezeOrch.volumeAttachmentsMu.RUnlock()
+
+	va, exists := freezeOrch.volumeAttachments[volumeHandle]
+	if !exists {
+		return nil, false
+	}
+	return va.DeepCopy(), true
+}
+
+// isVolumeAttachmentTrackerInitialized returns whether the VolumeAttachment tracker has been initialized
+func (freezeOrch *FreezeOrchestrator) isVolumeAttachmentTrackerInitialized() bool {
+	return freezeOrch.vaTrackerInitialized.Load()
 }

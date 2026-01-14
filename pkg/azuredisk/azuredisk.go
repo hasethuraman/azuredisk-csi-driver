@@ -438,6 +438,19 @@ func (d *Driver) Run(ctx context.Context) error {
 	csi.RegisterControllerServer(s, d)
 	csi.RegisterNodeServer(s, d)
 
+	// Initialize VolumeAttachment tracking for controller if snapshot consistency is enabled
+	if d.NodeID == "" && d.enableSnapshotConsistency && d.freezeOrchestrator != nil {
+		// Only on controller (NodeID is empty on controller)
+		// Run in background to avoid blocking driver bootstrap
+		go func() {
+			if err := d.InitializeVolumeAttachmentTracking(ctx); err != nil {
+				klog.Errorf("Failed to initialize VolumeAttachment tracking, snapshots will proceed without freeze consistency: %v", err)
+				// Mark tracker as failed so CreateSnapshot can fallback without consistency
+				d.freezeOrchestrator.vaTrackerInitFailed.Store(true)
+			}
+		}()
+	}
+
 	// Start VolumeAttachment watcher for node driver if snapshot consistency is enabled
 	if d.NodeID != "" && d.enableSnapshotConsistency && d.cloud != nil && d.cloud.KubeClient != nil {
 		d.startVolumeAttachmentWatcher(ctx)
@@ -453,6 +466,7 @@ func (d *Driver) Run(ctx context.Context) error {
 		}
 
 		// Stop VolumeAttachment watcher if it exists
+		d.StopVolumeAttachmentTracking()
 		d.stopVolumeAttachmentWatcher()
 
 		s.GracefulStop()
