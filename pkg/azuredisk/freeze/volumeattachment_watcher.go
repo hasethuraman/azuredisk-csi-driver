@@ -567,18 +567,22 @@ func (w *VolumeAttachmentWatcher) reconcile(ctx context.Context) {
 		if w.isTimedOut(state.Timestamp.Format(time.RFC3339)) {
 			klog.Warningf("Reconciler: frozen volume %s has timed out (frozen at %v), attempting unfreeze", volumeUUID, state.Timestamp)
 
-			// Find mount path - try to construct it from volumeUUID
-			// For CSI volumes, the staging path is typically /var/lib/kubelet/plugins/kubernetes.io/csi/pv/<pv-name>/globalmount
-			mountPath := filepath.Join("/var/lib/kubelet/plugins/kubernetes.io/csi/pv", volumeUUID, "globalmount")
-
-			// Verify the mount exists before attempting unfreeze
-			if w.mounter != nil {
-				notMnt, err := w.mounter.IsLikelyNotMountPoint(mountPath)
-				if err != nil || notMnt {
-					klog.V(4).Infof("Reconciler: mount path %s not found for timed out volume %s, cleaning up state", mountPath, volumeUUID)
-					w.freezeManager.CleanupState(volumeUUID)
-					continue
+			// Try to find mount path via VolumeAttachment
+			var mountPath string
+			if va, exists := vaByVolumeUUID[volumeUUID]; exists {
+				path, _, err := w.getMountInfo(va)
+				if err != nil {
+					klog.V(4).Infof("Reconciler: failed to get mount info for volume %s: %v", volumeUUID, err)
+				} else {
+					mountPath = path
 				}
+			}
+
+			// If mount path not found, clean up state
+			if mountPath == "" {
+				klog.V(4).Infof("Reconciler: mount path not found for timed out volume %s, cleaning up state", volumeUUID)
+				w.freezeManager.CleanupState(volumeUUID)
+				continue
 			}
 
 			// Attempt unfreeze
