@@ -805,7 +805,9 @@ func removeTaintInBackground(k8sClient clientset.Interface, nodeName, driverName
 		return true, nil
 	})
 
-	klog.Errorf("taint removal returned with error: %v", backoffErr)
+	if backoffErr != nil {
+		klog.Errorf("taint removal returned with error: %v", backoffErr)
+	}
 	if neverStop {
 		klog.V(2).Infof("Starting taint removal loop, will retry indefinitely")
 		for {

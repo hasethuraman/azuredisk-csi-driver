@@ -18,6 +18,8 @@ package freeze
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"path/filepath"
 	"strconv"
@@ -360,13 +362,13 @@ func (w *VolumeAttachmentWatcher) updateFreezeState(ctx context.Context, va *sto
 
 // getMountInfo returns the mount path and volume UUID for a VolumeAttachment
 func (w *VolumeAttachmentWatcher) getMountInfo(va *storagev1.VolumeAttachment) (string, string, error) {
-	volumeHandle := va.Spec.Source.PersistentVolumeName
-	if volumeHandle == nil || *volumeHandle == "" {
-		return "", "", fmt.Errorf("volume handle not found")
+	pvName := va.Spec.Source.PersistentVolumeName
+	if pvName == nil || *pvName == "" {
+		return "", "", fmt.Errorf("PV name not found in VolumeAttachment")
 	}
 
 	// Get PV to find volume information
-	pv, err := w.kubeClient.CoreV1().PersistentVolumes().Get(context.Background(), *volumeHandle, metav1.GetOptions{})
+	pv, err := w.kubeClient.CoreV1().PersistentVolumes().Get(context.Background(), *pvName, metav1.GetOptions{})
 	if err != nil {
 		return "", "", fmt.Errorf("failed to get PV: %v", err)
 	}
@@ -376,15 +378,27 @@ func (w *VolumeAttachmentWatcher) getMountInfo(va *storagev1.VolumeAttachment) (
 		return "", "", fmt.Errorf("block volume mode not supported for freeze")
 	}
 
-	// Extract volume UUID
-	volumeUUID := extractVolumeUUID(*volumeHandle)
+	// Get CSI volume handle from PV
+	if pv.Spec.CSI == nil || pv.Spec.CSI.VolumeHandle == "" {
+		return "", "", fmt.Errorf("CSI volume handle not found in PV %s", *pvName)
+	}
+	csiVolumeHandle := pv.Spec.CSI.VolumeHandle
+	driverName := pv.Spec.CSI.Driver
+
+	// Extract volume UUID from the CSI volume handle
+	volumeUUID := extractVolumeUUID(csiVolumeHandle)
 	if volumeUUID == "" {
-		return "", "", fmt.Errorf("failed to extract volume UUID from %s", *volumeHandle)
+		return "", "", fmt.Errorf("failed to extract volume UUID from %s", csiVolumeHandle)
 	}
 
+	// Compute SHA256 hash of the CSI volume handle for the staging path
+	// Kubernetes uses this hash to create the staging directory
+	hash := sha256.Sum256([]byte(csiVolumeHandle))
+	volumeHash := hex.EncodeToString(hash[:])
+
 	// Find the staging mount path
-	// For CSI volumes, the staging path is typically /var/lib/kubelet/plugins/kubernetes.io/csi/pv/<pv-name>/globalmount
-	stagingPath := filepath.Join("/var/lib/kubelet/plugins/kubernetes.io/csi/pv", *volumeHandle, "globalmount")
+	// For CSI volumes, the staging path is: /var/lib/kubelet/plugins/kubernetes.io/csi/<driver-name>/<sha256-hash>/globalmount
+	stagingPath := filepath.Join("/var/lib/kubelet/plugins/kubernetes.io/csi", driverName, volumeHash, "globalmount")
 
 	// Verify the mount exists
 	if w.mounter != nil {
