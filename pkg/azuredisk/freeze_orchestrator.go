@@ -187,7 +187,7 @@ func (d *Driver) CheckOrRequestFreeze(ctx context.Context, sourceVolumeID, snaps
 
 				if snapshotCreated && freezeState != "" {
 					// Create a kubernetes warning event for freeze state
-					d.logFreezeEvent(sourceVolumeID, snapshotName,
+					d.logFreezeEvent(sourceVolumeID, snapshotName, namespace,
 						fmt.Sprintf("Snapshot created but filesystem freeze %s. Data consistency is not guaranteed.", freezeState),
 						orchestrator.isSnapshotStrictMode())
 				}
@@ -321,6 +321,22 @@ func (freezeOrch *FreezeOrchestrator) CheckOrRequestFreeze(ctx context.Context, 
 
 	// Case 2: freeze-required exists but no freeze-state yet - still waiting
 	if freezeState == "" {
+		// Ensure tracking exists (may be lost due to controller restart or leader election)
+		if !exists {
+			freezeTime, parseErr := time.Parse(time.RFC3339, freezeRequired)
+			if parseErr != nil {
+				freezeTime = time.Now()
+			}
+			freezeOrch.addTracking(snapshotName, &snapshotTracking{
+				volumeHandle:         volumeHandle,
+				snapshotName:         snapshotName,
+				snapshotNamespace:    snapshotNamespace,
+				freezeRequiredTime:   freezeTime,
+				volumeAttachmentName: targetVA.Name,
+			})
+			klog.V(4).Infof("CheckOrRequestFreeze: re-added tracking for snapshot %s after controller restart", snapshotName)
+		}
+
 		// Check timeout
 		freezeTime, err := time.Parse(time.RFC3339, freezeRequired)
 		if err != nil {
@@ -330,6 +346,13 @@ func (freezeOrch *FreezeOrchestrator) CheckOrRequestFreeze(ctx context.Context, 
 
 		if freezeOrch.hasTimedOut(freezeTime) {
 			klog.Warningf("CheckOrRequestFreeze: freeze timed out for snapshot %s", snapshotName)
+			// Set freeze-state annotation on VolumeSnapshot to record the timeout
+			if freezeOrch.snapshotClient != nil && snapshotNamespace != "" {
+				if err := freezeOrch.setFreezeStateAnnotationOnSnapshot(ctx, snapshotName, snapshotNamespace, freeze.FreezeStateSkipped); err != nil {
+					klog.Warningf("CheckOrRequestFreeze: failed to set freeze-state annotation on VolumeSnapshot after timeout: %v", err)
+					// Not a fatal error - continue with snapshot
+				}
+			}
 			// In strict mode, this is an error; in best-effort, proceed
 			if freezeOrch.isSnapshotStrictMode() {
 				return freeze.FreezeStateSkipped, false, fmt.Errorf("freeze operation timed out in strict mode")
@@ -342,6 +365,22 @@ func (freezeOrch *FreezeOrchestrator) CheckOrRequestFreeze(ctx context.Context, 
 	}
 
 	// Case 3: freeze-state exists - check if we should proceed
+	// Ensure tracking exists (may be lost due to controller restart or leader election)
+	if !exists {
+		freezeTime, parseErr := time.Parse(time.RFC3339, freezeRequired)
+		if parseErr != nil {
+			freezeTime = time.Now()
+		}
+		freezeOrch.addTracking(snapshotName, &snapshotTracking{
+			volumeHandle:         volumeHandle,
+			snapshotName:         snapshotName,
+			snapshotNamespace:    snapshotNamespace,
+			freezeRequiredTime:   freezeTime,
+			volumeAttachmentName: targetVA.Name,
+		})
+		klog.V(4).Infof("CheckOrRequestFreeze: re-added tracking for snapshot %s after controller restart", snapshotName)
+	}
+
 	klog.V(2).Infof("CheckOrRequestFreeze: freeze state for snapshot %s: %s", snapshotName, freezeState)
 
 	// Copy freeze-state annotation to VolumeSnapshot (but never remove it)
@@ -747,7 +786,7 @@ func (freezeOrch *FreezeOrchestrator) isVolumeAttached(_ctx context.Context, vol
 }
 
 // logFreezeEvent creates a Kubernetes event for freeze-related issues
-func (d *Driver) logFreezeEvent(volumeHandle string, snapshotName string, message string, isWarning bool) {
+func (d *Driver) logFreezeEvent(volumeHandle string, snapshotName string, snapshotNamespace string, message string, isWarning bool) {
 	if d.eventRecorder == nil {
 		klog.Warningf("Event recorder not available, logging event instead: %s", message)
 		if isWarning {
@@ -767,15 +806,8 @@ func (d *Driver) logFreezeEvent(volumeHandle string, snapshotName string, messag
 		return
 	}
 
-	// Get the snapshot tracking to find namespace
-	tracking, exists := orchestrator.getTracking(snapshotName)
-	if !exists {
-		klog.Warningf("Snapshot tracking not found for %s, cannot create event", snapshotName)
-		return
-	}
-
 	// Get VolumeSnapshot object to record event against
-	snapshot, err := orchestrator.snapshotClient.SnapshotV1().VolumeSnapshots(tracking.snapshotNamespace).Get(context.Background(), snapshotName, metav1.GetOptions{})
+	snapshot, err := orchestrator.snapshotClient.SnapshotV1().VolumeSnapshots(snapshotNamespace).Get(context.Background(), snapshotName, metav1.GetOptions{})
 	if err != nil {
 		klog.Warningf("Failed to get VolumeSnapshot %s for event recording: %v", snapshotName, err)
 		return
