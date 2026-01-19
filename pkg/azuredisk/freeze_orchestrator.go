@@ -246,14 +246,17 @@ func (freezeOrch *FreezeOrchestrator) CheckOrRequestFreeze(ctx context.Context, 
 			return "", true, nil
 		}
 
+		// Check if this volume uses a SKU that should skip freeze (e.g., PremiumV2_LRS)
+		// This check is independent of VolumeMode because PremiumV2 snapshots take a long time
+		if freezeOrch.shouldSkipFreezeBySKU(pv) {
+			klog.V(4).Infof("CheckOrRequestFreeze: volume %s uses SKU that should skip freeze, adding to cache", volumeHandle)
+			freezeOrch.addToSkipFreezeCache(volumeHandle)
+			return "", true, nil
+		}
+
 		// Only freeze filesystem volumes
 		if pv.Spec.VolumeMode != nil && *pv.Spec.VolumeMode == corev1.PersistentVolumeBlock {
 			klog.V(4).Infof("CheckOrRequestFreeze: volume %s is block mode, skipping freeze", volumeHandle)
-			// Check if this volume uses a SKU that should skip freeze
-			if freezeOrch.shouldSkipFreezeBySKU(pv) {
-				klog.V(4).Infof("CheckOrRequestFreeze: volume %s uses a SKU that should skip freeze, adding to cache", volumeHandle)
-				freezeOrch.addToSkipFreezeCache(volumeHandle)
-			}
 			return "", true, nil
 		}
 
