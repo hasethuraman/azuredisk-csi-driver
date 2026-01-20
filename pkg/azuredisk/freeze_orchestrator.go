@@ -105,7 +105,8 @@ func NewFreezeOrchestrator(
 	snapshotConsistencyMode string,
 	freezeWaitTimeoutMinutes int64,
 ) *FreezeOrchestrator {
-	if freezeWaitTimeoutMinutes <= 0 {
+	// Note: 0 means indefinite wait in strict mode, only use default for negative values
+	if freezeWaitTimeoutMinutes < 0 {
 		freezeWaitTimeoutMinutes = azureconstants.DefaultFreezeWaitTimeoutMinutes
 	}
 
