@@ -3809,6 +3809,7 @@ func TestCreateSnapshot_FreezeIntegration(t *testing.T) {
 			Name:           "test-snapshot",
 			Parameters: map[string]string{
 				consts.ResourceGroupField:         "rg",
+				consts.VolumeSnapshotNameKey:      "test-snapshot",
 				consts.VolumeSnapshotNamespaceKey: "default",
 			},
 		}
@@ -4037,6 +4038,7 @@ func TestCreateSnapshot_FreezeIntegration(t *testing.T) {
 			Name:           snapshotName,
 			Parameters: map[string]string{
 				consts.ResourceGroupField:         "rg",
+				consts.VolumeSnapshotNameKey:      snapshotName,
 				consts.VolumeSnapshotNamespaceKey: "default",
 			},
 		}
@@ -4287,6 +4289,7 @@ func TestCreateSnapshot_FreezeIntegration(t *testing.T) {
 			Name:           snapshotName,
 			Parameters: map[string]string{
 				consts.ResourceGroupField:         "rg",
+				consts.VolumeSnapshotNameKey:      snapshotName,
 				consts.VolumeSnapshotNamespaceKey: "default",
 			},
 		}

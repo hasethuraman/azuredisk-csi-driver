@@ -146,13 +146,18 @@ func (d *Driver) CheckOrRequestFreeze(ctx context.Context, sourceVolumeID, snaps
 	// Follow CSI pattern: return ready_to_use=false when waiting, ready_to_use=true when done
 	var freezeState string
 	var freezeSkipped bool
+	var freezeComplete bool
+	var err error
 	if d.shouldEnableFreeze() {
 		orchestrator := d.getFreezeOrchestrator()
 		if orchestrator != nil {
-			freezeState, freezeComplete, err := orchestrator.CheckOrRequestFreeze(ctx, sourceVolumeID, snapshotName, namespace)
+			freezeState, freezeComplete, err = orchestrator.CheckOrRequestFreeze(ctx, sourceVolumeID, snapshotName, namespace)
 			if err != nil {
 				// Error in strict mode or unable to set annotation
 				klog.Errorf("Failed to check/request freeze for snapshot %s: %v", snapshotName, err)
+				// Generate error event for freeze timeout/failure
+				d.logFreezeEvent(sourceVolumeID, snapshotName, namespace,
+					fmt.Sprintf("Snapshot consistency check failed: %v", err), true)
 				orchestrator.ReleaseFreeze(ctx, sourceVolumeID, snapshotName, namespace)
 				return status.Errorf(codes.FailedPrecondition,
 					"snapshot consistency check failed: %v", err), nil
@@ -203,6 +208,24 @@ func (d *Driver) CheckOrRequestFreeze(ctx context.Context, sourceVolumeID, snaps
 // for best effort we set isReadyToSnapshot to true even if freeze failed
 func (freezeOrch *FreezeOrchestrator) CheckOrRequestFreeze(ctx context.Context, volumeHandle string, snapshotName string, snapshotNamespace string) (string, bool, error) {
 	klog.V(4).Infof("CheckOrRequestFreeze: volume %s snapshot %s", volumeHandle, snapshotName)
+
+	// Check if VolumeSnapshot already has a terminal freeze-state annotation (e.g., from a previous timeout)
+	// This prevents restarting the freeze cycle after a timeout has already occurred
+	if freezeOrch.snapshotClient != nil && snapshotNamespace != "" {
+		existingState, err := freezeOrch.getSnapshotFreezeState(ctx, snapshotName, snapshotNamespace)
+		if err != nil {
+			klog.V(4).Infof("CheckOrRequestFreeze: failed to get freeze-state from VolumeSnapshot %s: %v", snapshotName, err)
+			// Continue - the snapshot may not exist yet or there was a transient error
+		} else if existingState == freeze.FreezeStateSkipped {
+			// Snapshot already has freeze-state: skipped - this was set after a timeout
+			// Return error in strict mode, or allow proceed in best-effort mode
+			klog.V(2).Infof("CheckOrRequestFreeze: snapshot %s already has freeze-state: skipped from previous timeout", snapshotName)
+			if freezeOrch.isSnapshotStrictMode() {
+				return freeze.FreezeStateSkipped, false, fmt.Errorf("freeze operation timed out in strict mode")
+			}
+			return freeze.FreezeStateSkipped, true, nil
+		}
+	}
 
 	// Check if this volume is in the skip list (cached from previous checks)
 	if freezeOrch.shouldSkipFreezeFromCache(volumeHandle) {
@@ -510,6 +533,24 @@ func (freezeOrch *FreezeOrchestrator) setFreezeRequiredAnnotationOnSnapshot(ctx 
 
 	_, err = freezeOrch.snapshotClient.SnapshotV1().VolumeSnapshots(namespace).Update(ctx, snapshotCopy, metav1.UpdateOptions{})
 	return err
+}
+
+// getSnapshotFreezeState retrieves the freeze-state annotation from VolumeSnapshot
+func (freezeOrch *FreezeOrchestrator) getSnapshotFreezeState(ctx context.Context, snapshotName string, namespace string) (string, error) {
+	if freezeOrch.snapshotClient == nil {
+		return "", fmt.Errorf("snapshot client not available")
+	}
+
+	snapshot, err := freezeOrch.snapshotClient.SnapshotV1().VolumeSnapshots(namespace).Get(ctx, snapshotName, metav1.GetOptions{})
+	if err != nil {
+		return "", fmt.Errorf("failed to get VolumeSnapshot: %v", err)
+	}
+
+	if snapshot.Annotations == nil {
+		return "", nil
+	}
+
+	return snapshot.Annotations[freeze.AnnotationFreezeState], nil
 }
 
 // setFreezeStateAnnotationOnSnapshot sets the freeze-state annotation on VolumeSnapshot

@@ -59,6 +59,8 @@ controller:
       - RecoverVolumeExpansionFailure=true
       - VolumeAttributesClass=true
 
+  snapshotConsistencyMode: "best-effort"  # Options: "best-effort", "strict", "none"
+  freezeWaitTimeoutMinutes: 2  # Timeout in minutes for freeze operations
   VMSSDetachTimeoutInSeconds: 20
   allowEmptyCloudConfig: false
   enableTrafficManager: false

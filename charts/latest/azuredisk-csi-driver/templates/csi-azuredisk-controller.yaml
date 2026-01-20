@@ -244,6 +244,8 @@ spec:
             - "--enable-otel-tracing={{ .Values.controller.otelTracing.enabled }}"
             - "--check-disk-lun-collision=true"
             - "--vmss-detach-timeout-seconds={{ .Values.controller.VMSSDetachTimeoutInSeconds }}"
+            - "--snapshot-consistency-mode={{ .Values.controller.snapshotConsistencyMode }}"
+            - "--fsfreeze-wait-timeout-mins={{ .Values.controller.freezeWaitTimeoutMinutes }}"
             {{- range $value := .Values.controller.extraArgs }}
             - {{ $value | quote }}
             {{- end }}

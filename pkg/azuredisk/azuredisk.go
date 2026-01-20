@@ -28,6 +28,7 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v6"
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	snapshotv1 "github.com/kubernetes-csi/external-snapshotter/client/v4/apis/volumesnapshot/v1"
 	snapshotclientset "github.com/kubernetes-csi/external-snapshotter/client/v4/clientset/versioned"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 
@@ -61,6 +62,13 @@ import (
 	azurecloudconsts "sigs.k8s.io/cloud-provider-azure/pkg/consts"
 	azure "sigs.k8s.io/cloud-provider-azure/pkg/provider"
 )
+
+func init() {
+	// Register VolumeSnapshot types with the scheme so events can be recorded against them
+	if err := snapshotv1.AddToScheme(scheme.Scheme); err != nil {
+		klog.Errorf("Failed to add VolumeSnapshot scheme: %v", err)
+	}
+}
 
 var (
 	// taintRemovalBackoff is the exponential backoff configuration for node taint removal
