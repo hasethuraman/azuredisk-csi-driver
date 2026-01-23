@@ -262,7 +262,22 @@ func (fm *FreezeManager) analyzeFreezeError(err error, output string) string {
 		return FreezeStateFrozen
 	}
 
-	// Check for specific errno values
+	// Check output for specific error messages FIRST
+	// This is more reliable than errno since fsfreeze returns exit code 1 for various errors
+	outputLower := strings.ToLower(output)
+	if strings.Contains(outputLower, "device or resource busy") {
+		// Already frozen - could be user-frozen or double freeze
+		klog.V(2).Infof("Freeze: filesystem already frozen (Device or resource busy)")
+		return FreezeStateUserFrozen
+	}
+	if strings.Contains(outputLower, "not supported") || strings.Contains(outputLower, "not a directory") {
+		return FreezeStateSkipped
+	}
+	if strings.Contains(outputLower, "not found") || strings.Contains(outputLower, "no such file") {
+		return FreezeStateSkipped
+	}
+
+	// Check for specific errno values as fallback
 	if exitErr, ok := err.(*exec.ExitError); ok {
 		if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
 			errno := syscall.Errno(status.ExitStatus())
@@ -299,18 +314,6 @@ func (fm *FreezeManager) analyzeFreezeError(err error, output string) string {
 				return FreezeStateSkipped
 			}
 		}
-	}
-
-	// Check output for specific error messages
-	outputLower := strings.ToLower(output)
-	if strings.Contains(outputLower, "device or resource busy") {
-		return FreezeStateUserFrozen
-	}
-	if strings.Contains(outputLower, "not supported") || strings.Contains(outputLower, "not a directory") {
-		return FreezeStateSkipped
-	}
-	if strings.Contains(outputLower, "not found") || strings.Contains(outputLower, "no such file") {
-		return FreezeStateSkipped
 	}
 
 	// Default to failed
