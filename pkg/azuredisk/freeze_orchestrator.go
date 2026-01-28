@@ -53,8 +53,9 @@ const (
 // This is specifically for block volumes with known SKUs where snapshot operations take longer time
 // (e.g., PremiumV2_LRS snapshots can take 5+ minutes). By caching these volumes, we optimize the
 // retry path to avoid querying VolumeAttachments and other Kubernetes resources on subsequent calls.
+// NOTE: PremiumV2_LRS removed for testing - freeze will now be attempted on all SKUs
 var skusToSkipFreeze = []string{
-	"PremiumV2_LRS",
+	// "PremiumV2_LRS",
 }
 
 // FreezeOrchestrator manages the freeze/unfreeze workflow from controller side
@@ -210,23 +211,23 @@ func (d *Driver) CheckOrRequestFreeze(ctx context.Context, sourceVolumeID, snaps
 func (freezeOrch *FreezeOrchestrator) CheckOrRequestFreeze(ctx context.Context, volumeHandle string, snapshotName string, snapshotNamespace string) (string, bool, error) {
 	klog.V(4).Infof("CheckOrRequestFreeze: volume %s snapshot %s", volumeHandle, snapshotName)
 
-	// Check if VolumeSnapshot already has a terminal freeze-state annotation (e.g., from a previous timeout)
-	// This prevents restarting the freeze cycle after a timeout has already occurred
-	if freezeOrch.snapshotClient != nil && snapshotNamespace != "" {
-		existingState, err := freezeOrch.getSnapshotFreezeState(ctx, snapshotName, snapshotNamespace)
-		if err != nil {
-			klog.V(4).Infof("CheckOrRequestFreeze: failed to get freeze-state from VolumeSnapshot %s: %v", snapshotName, err)
-			// Continue - the snapshot may not exist yet or there was a transient error
-		} else if existingState == freeze.FreezeStateSkipped {
-			// Snapshot already has freeze-state: skipped - this was set after a timeout
-			// Return error in strict mode, or allow proceed in best-effort mode
-			klog.V(2).Infof("CheckOrRequestFreeze: snapshot %s already has freeze-state: skipped from previous timeout", snapshotName)
-			if freezeOrch.isSnapshotStrictMode() {
-				return freeze.FreezeStateSkipped, false, fmt.Errorf("freeze operation timed out in strict mode")
-			}
-			return freeze.FreezeStateSkipped, true, nil
-		}
-	}
+	// // Check if VolumeSnapshot already has a terminal freeze-state annotation (e.g., from a previous timeout)
+	// // This prevents restarting the freeze cycle after a timeout has already occurred
+	// if freezeOrch.snapshotClient != nil && snapshotNamespace != "" {
+	// 	existingState, err := freezeOrch.getSnapshotFreezeState(ctx, snapshotName, snapshotNamespace)
+	// 	if err != nil {
+	// 		klog.V(4).Infof("CheckOrRequestFreeze: failed to get freeze-state from VolumeSnapshot %s: %v", snapshotName, err)
+	// 		// Continue - the snapshot may not exist yet or there was a transient error
+	// 	} else if existingState == freeze.FreezeStateSkipped {
+	// 		// Snapshot already has freeze-state: skipped - this was set after a timeout
+	// 		// Return error in strict mode, or allow proceed in best-effort mode
+	// 		klog.V(2).Infof("CheckOrRequestFreeze: snapshot %s already has freeze-state: skipped from previous timeout", snapshotName)
+	// 		if freezeOrch.isSnapshotStrictMode() {
+	// 			return freeze.FreezeStateSkipped, false, fmt.Errorf("freeze operation timed out in strict mode")
+	// 		}
+	// 		return freeze.FreezeStateSkipped, true, nil
+	// 	}
+	// }
 
 	// Check if this volume is in the skip list (cached from previous checks)
 	if freezeOrch.shouldSkipFreezeFromCache(volumeHandle) {
@@ -270,9 +271,9 @@ func (freezeOrch *FreezeOrchestrator) CheckOrRequestFreeze(ctx context.Context, 
 			return "", true, nil
 		}
 
-		// Check if this volume uses a SKU that should skip freeze (e.g., PremiumV2_LRS)
-		// This check is independent of VolumeMode because PremiumV2 snapshots take a long time
-		if freezeOrch.shouldSkipFreezeBySKU(pv) {
+		// Check if this volume uses a high-latency snapshot SKU that should skip freeze
+		// This check is independent of VolumeMode because these SKUs have extended snapshot times
+		if freezeOrch.skipHighLatencySnapshotSku(pv) {
 			klog.V(4).Infof("CheckOrRequestFreeze: volume %s uses SKU that should skip freeze, adding to cache", volumeHandle)
 			freezeOrch.addToSkipFreezeCache(volumeHandle)
 			return "", true, nil
@@ -343,24 +344,11 @@ func (freezeOrch *FreezeOrchestrator) CheckOrRequestFreeze(ctx context.Context, 
 		return "", false, nil // Return false to indicate retry needed
 	}
 
+	// Ensure tracking exists for Case 2 and Case 3 (may be lost due to controller restart or leader election)
+	freezeOrch.ensureTrackingExists(exists, snapshotName, volumeHandle, snapshotNamespace, freezeRequired, targetVA.Name)
+
 	// Case 2: freeze-required exists but no freeze-state yet - still waiting
 	if freezeState == "" {
-		// Ensure tracking exists (may be lost due to controller restart or leader election)
-		if !exists {
-			freezeTime, parseErr := time.Parse(time.RFC3339, freezeRequired)
-			if parseErr != nil {
-				freezeTime = time.Now()
-			}
-			freezeOrch.addTracking(snapshotName, &snapshotTracking{
-				volumeHandle:         volumeHandle,
-				snapshotName:         snapshotName,
-				snapshotNamespace:    snapshotNamespace,
-				freezeRequiredTime:   freezeTime,
-				volumeAttachmentName: targetVA.Name,
-			})
-			klog.V(4).Infof("CheckOrRequestFreeze: re-added tracking for snapshot %s after controller restart", snapshotName)
-		}
-
 		// Check timeout
 		freezeTime, err := time.Parse(time.RFC3339, freezeRequired)
 		if err != nil {
@@ -389,22 +377,6 @@ func (freezeOrch *FreezeOrchestrator) CheckOrRequestFreeze(ctx context.Context, 
 	}
 
 	// Case 3: freeze-state exists - check if we should proceed
-	// Ensure tracking exists (may be lost due to controller restart or leader election)
-	if !exists {
-		freezeTime, parseErr := time.Parse(time.RFC3339, freezeRequired)
-		if parseErr != nil {
-			freezeTime = time.Now()
-		}
-		freezeOrch.addTracking(snapshotName, &snapshotTracking{
-			volumeHandle:         volumeHandle,
-			snapshotName:         snapshotName,
-			snapshotNamespace:    snapshotNamespace,
-			freezeRequiredTime:   freezeTime,
-			volumeAttachmentName: targetVA.Name,
-		})
-		klog.V(4).Infof("CheckOrRequestFreeze: re-added tracking for snapshot %s after controller restart", snapshotName)
-	}
-
 	klog.V(2).Infof("CheckOrRequestFreeze: freeze state for snapshot %s: %s", snapshotName, freezeState)
 
 	// Copy freeze-state annotation to VolumeSnapshot (but never remove it)
@@ -729,6 +701,26 @@ func (freezeOrch *FreezeOrchestrator) removeTracking(snapshotName string, volume
 	freezeOrch.releaseVolumeLock(volumeHandle)
 }
 
+// ensureTrackingExists restores tracking if it was lost due to controller restart or leader election
+func (freezeOrch *FreezeOrchestrator) ensureTrackingExists(exists bool, snapshotName, volumeHandle, snapshotNamespace, freezeRequired, volumeAttachmentName string) {
+	if exists {
+		return
+	}
+
+	freezeTime, parseErr := time.Parse(time.RFC3339, freezeRequired)
+	if parseErr != nil {
+		freezeTime = time.Now()
+	}
+	freezeOrch.addTracking(snapshotName, &snapshotTracking{
+		volumeHandle:         volumeHandle,
+		snapshotName:         snapshotName,
+		snapshotNamespace:    snapshotNamespace,
+		freezeRequiredTime:   freezeTime,
+		volumeAttachmentName: volumeAttachmentName,
+	})
+	klog.V(4).Infof("ensureTrackingExists: re-added tracking for snapshot %s after controller restart", snapshotName)
+}
+
 // addToSkipFreezeCache adds a volume to the skip freeze LRU cache
 func (freezeOrch *FreezeOrchestrator) addToSkipFreezeCache(volumeHandle string) {
 	freezeOrch.skipFreezeMu.Lock()
@@ -747,8 +739,9 @@ func (freezeOrch *FreezeOrchestrator) shouldSkipFreezeFromCache(volumeHandle str
 	return exists
 }
 
-// shouldSkipFreezeBySKU checks if a volume's SKU should skip freeze
-func (freezeOrch *FreezeOrchestrator) shouldSkipFreezeBySKU(pv *corev1.PersistentVolume) bool {
+// skipHighLatencySnapshotSku checks if the volume's SKU has extended snapshot operation times
+// that make filesystem freeze impractical (e.g., PremiumV2_LRS snapshots can take 5+ minutes)
+func (freezeOrch *FreezeOrchestrator) skipHighLatencySnapshotSku(pv *corev1.PersistentVolume) bool {
 	if pv.Spec.CSI == nil || pv.Spec.CSI.VolumeAttributes == nil {
 		return false
 	}

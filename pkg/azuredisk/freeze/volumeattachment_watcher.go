@@ -293,7 +293,9 @@ func (w *VolumeAttachmentWatcher) processUnfreeze(ctx context.Context, va *stora
 		return
 	}
 	defer w.markProcessing(vaName, false)
-
+    
+	if /tmp/wait.snapshotct
+	   slee
 	// Get mount path and volume UUID
 	mountPath, volumeUUID, err := w.getMountInfo(va)
 	if err != nil {
