@@ -90,6 +90,12 @@ type FreezeOrchestrator struct {
 	bootstrapComplete    bool
 	vaTrackerInitialized atomic.Bool
 	vaTrackerInitFailed  atomic.Bool
+
+	// LRU cache of snapshots that have reached terminal state (timeout/failed)
+	// Maps snapshotName -> freezeState (e.g., "skipped", "failed")
+	// This prevents restarting freeze cycle on retry without K8s API calls
+	terminalSnapshotCache *lru.Cache
+	terminalSnapshotMu    sync.RWMutex
 }
 
 type snapshotTracking struct {
@@ -119,6 +125,7 @@ func NewFreezeOrchestrator(
 		ongoingSnapshots:         make(map[string]*snapshotTracking),
 		volumeLocks:              make(map[string]*sync.Mutex),
 		skipFreezeCache:          lru.New(maxSkipFreezeCacheSize),
+		terminalSnapshotCache:    lru.New(maxSkipFreezeCacheSize),
 		bootstrapComplete:        false,
 		volumeAttachments:        make(map[string]*storagev1.VolumeAttachment),
 		// vaTrackerInitialized defaults to false (atomic.Bool zero value)
@@ -211,23 +218,15 @@ func (d *Driver) CheckOrRequestFreeze(ctx context.Context, sourceVolumeID, snaps
 func (freezeOrch *FreezeOrchestrator) CheckOrRequestFreeze(ctx context.Context, volumeHandle string, snapshotName string, snapshotNamespace string) (string, bool, error) {
 	klog.V(4).Infof("CheckOrRequestFreeze: volume %s snapshot %s", volumeHandle, snapshotName)
 
-	// // Check if VolumeSnapshot already has a terminal freeze-state annotation (e.g., from a previous timeout)
-	// // This prevents restarting the freeze cycle after a timeout has already occurred
-	// if freezeOrch.snapshotClient != nil && snapshotNamespace != "" {
-	// 	existingState, err := freezeOrch.getSnapshotFreezeState(ctx, snapshotName, snapshotNamespace)
-	// 	if err != nil {
-	// 		klog.V(4).Infof("CheckOrRequestFreeze: failed to get freeze-state from VolumeSnapshot %s: %v", snapshotName, err)
-	// 		// Continue - the snapshot may not exist yet or there was a transient error
-	// 	} else if existingState == freeze.FreezeStateSkipped {
-	// 		// Snapshot already has freeze-state: skipped - this was set after a timeout
-	// 		// Return error in strict mode, or allow proceed in best-effort mode
-	// 		klog.V(2).Infof("CheckOrRequestFreeze: snapshot %s already has freeze-state: skipped from previous timeout", snapshotName)
-	// 		if freezeOrch.isSnapshotStrictMode() {
-	// 			return freeze.FreezeStateSkipped, false, fmt.Errorf("freeze operation timed out in strict mode")
-	// 		}
-	// 		return freeze.FreezeStateSkipped, true, nil
-	// 	}
-	// }
+	// Check in-memory cache for snapshots that have already reached terminal state (timeout/failed)
+	// This prevents restarting the freeze cycle on retry without making K8s API calls
+	if terminalState := freezeOrch.getTerminalSnapshotState(snapshotName); terminalState != "" {
+		klog.V(2).Infof("CheckOrRequestFreeze: snapshot %s found in terminal cache with state: %s", snapshotName, terminalState)
+		if freezeOrch.isSnapshotStrictMode() {
+			return terminalState, false, fmt.Errorf("freeze operation previously failed with state: %s", terminalState)
+		}
+		return terminalState, true, nil
+	}
 
 	// Check if this volume is in the skip list (cached from previous checks)
 	if freezeOrch.shouldSkipFreezeFromCache(volumeHandle) {
@@ -358,6 +357,8 @@ func (freezeOrch *FreezeOrchestrator) CheckOrRequestFreeze(ctx context.Context, 
 
 		if freezeOrch.hasTimedOut(freezeTime) {
 			klog.Warningf("CheckOrRequestFreeze: freeze timed out for snapshot %s", snapshotName)
+			// Add to terminal cache to prevent new freeze cycle on retry
+			freezeOrch.addTerminalSnapshot(snapshotName, freeze.FreezeStateSkipped)
 			// Set freeze-state annotation on VolumeSnapshot to record the timeout
 			if freezeOrch.snapshotClient != nil && snapshotNamespace != "" {
 				if err := freezeOrch.setFreezeStateAnnotationOnSnapshot(ctx, snapshotName, snapshotNamespace, freeze.FreezeStateSkipped); err != nil {
@@ -506,24 +507,6 @@ func (freezeOrch *FreezeOrchestrator) setFreezeRequiredAnnotationOnSnapshot(ctx 
 
 	_, err = freezeOrch.snapshotClient.SnapshotV1().VolumeSnapshots(namespace).Update(ctx, snapshotCopy, metav1.UpdateOptions{})
 	return err
-}
-
-// getSnapshotFreezeState retrieves the freeze-state annotation from VolumeSnapshot
-func (freezeOrch *FreezeOrchestrator) getSnapshotFreezeState(ctx context.Context, snapshotName string, namespace string) (string, error) {
-	if freezeOrch.snapshotClient == nil {
-		return "", fmt.Errorf("snapshot client not available")
-	}
-
-	snapshot, err := freezeOrch.snapshotClient.SnapshotV1().VolumeSnapshots(namespace).Get(ctx, snapshotName, metav1.GetOptions{})
-	if err != nil {
-		return "", fmt.Errorf("failed to get VolumeSnapshot: %v", err)
-	}
-
-	if snapshot.Annotations == nil {
-		return "", nil
-	}
-
-	return snapshot.Annotations[freeze.AnnotationFreezeState], nil
 }
 
 // setFreezeStateAnnotationOnSnapshot sets the freeze-state annotation on VolumeSnapshot
@@ -737,6 +720,28 @@ func (freezeOrch *FreezeOrchestrator) shouldSkipFreezeFromCache(volumeHandle str
 
 	_, exists := freezeOrch.skipFreezeCache.Get(volumeHandle)
 	return exists
+}
+
+// addTerminalSnapshot adds a snapshot to the terminal state cache
+func (freezeOrch *FreezeOrchestrator) addTerminalSnapshot(snapshotName string, state string) {
+	freezeOrch.terminalSnapshotMu.Lock()
+	defer freezeOrch.terminalSnapshotMu.Unlock()
+
+	freezeOrch.terminalSnapshotCache.Add(snapshotName, state)
+	klog.V(4).Infof("Added snapshot %s to terminal cache with state: %s", snapshotName, state)
+}
+
+// getTerminalSnapshotState returns the terminal state if snapshot is in cache, empty string otherwise
+func (freezeOrch *FreezeOrchestrator) getTerminalSnapshotState(snapshotName string) string {
+	freezeOrch.terminalSnapshotMu.RLock()
+	defer freezeOrch.terminalSnapshotMu.RUnlock()
+
+	if state, exists := freezeOrch.terminalSnapshotCache.Get(snapshotName); exists {
+		if stateStr, ok := state.(string); ok {
+			return stateStr
+		}
+	}
+	return ""
 }
 
 // skipHighLatencySnapshotSku checks if the volume's SKU has extended snapshot operation times
