@@ -167,7 +167,10 @@ func (d *Driver) CheckOrRequestFreeze(ctx context.Context, sourceVolumeID, snaps
 				// Generate error event for freeze timeout/failure
 				d.logFreezeEvent(sourceVolumeID, snapshotName, namespace,
 					fmt.Sprintf("Snapshot consistency check failed: %v", err), true)
-				orchestrator.ReleaseFreeze(ctx, sourceVolumeID, snapshotName, namespace)
+				// Only call ReleaseFreeze if there's tracking (skip for terminal cache hits)
+				if _, hasTracking := orchestrator.getTracking(snapshotName); hasTracking {
+					orchestrator.ReleaseFreeze(ctx, sourceVolumeID, snapshotName, namespace)
+				}
 				return status.Errorf(codes.FailedPrecondition,
 					"snapshot consistency check failed: %v", err), nil
 			} else if !freezeComplete {
@@ -456,6 +459,9 @@ func (freezeOrch *FreezeOrchestrator) ReleaseFreeze(ctx context.Context, volumeH
 
 	freezeOrch.removeTracking(snapshotName, volumeHandle)
 
+	// Clear from terminal cache so a new snapshot with same name can start fresh
+	freezeOrch.removeTerminalSnapshot(snapshotName)
+
 	klog.V(2).Infof("ReleaseFreeze: released freeze for snapshot %s on VA %s", snapshotName, tracking.volumeAttachmentName)
 	return nil
 }
@@ -742,6 +748,16 @@ func (freezeOrch *FreezeOrchestrator) getTerminalSnapshotState(snapshotName stri
 		}
 	}
 	return ""
+}
+
+// removeTerminalSnapshot removes a snapshot from the terminal cache
+// This allows a new snapshot with the same name to start a fresh freeze cycle
+func (freezeOrch *FreezeOrchestrator) removeTerminalSnapshot(snapshotName string) {
+	freezeOrch.terminalSnapshotMu.Lock()
+	defer freezeOrch.terminalSnapshotMu.Unlock()
+
+	freezeOrch.terminalSnapshotCache.Remove(snapshotName)
+	klog.V(4).Infof("Removed snapshot %s from terminal cache", snapshotName)
 }
 
 // skipHighLatencySnapshotSku checks if the volume's SKU has extended snapshot operation times
