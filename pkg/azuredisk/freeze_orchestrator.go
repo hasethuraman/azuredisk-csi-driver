@@ -201,6 +201,9 @@ func (d *Driver) CheckOrRequestFreeze(ctx context.Context, sourceVolumeID, snaps
 				if err := orchestrator.ReleaseFreeze(context.Background(), sourceVolumeID, snapshotName, namespace); err != nil {
 					klog.Errorf("Failed to release freeze for snapshot %s: %v", snapshotName, err)
 				}
+				// Clear terminal cache only on success path so retries after timeout
+				// don't restart the freeze cycle
+				orchestrator.removeTerminalSnapshot(snapshotName)
 
 				if snapshotCreated && freezeState != "" {
 					// Create a kubernetes warning event for freeze state
@@ -458,9 +461,6 @@ func (freezeOrch *FreezeOrchestrator) ReleaseFreeze(ctx context.Context, volumeH
 	}
 
 	freezeOrch.removeTracking(snapshotName, volumeHandle)
-
-	// Clear from terminal cache so a new snapshot with same name can start fresh
-	freezeOrch.removeTerminalSnapshot(snapshotName)
 
 	klog.V(2).Infof("ReleaseFreeze: released freeze for snapshot %s on VA %s", snapshotName, tracking.volumeAttachmentName)
 	return nil
@@ -734,7 +734,7 @@ func (freezeOrch *FreezeOrchestrator) addTerminalSnapshot(snapshotName string, s
 	defer freezeOrch.terminalSnapshotMu.Unlock()
 
 	freezeOrch.terminalSnapshotCache.Add(snapshotName, state)
-	klog.V(4).Infof("Added snapshot %s to terminal cache with state: %s", snapshotName, state)
+	klog.V(2).Infof("Added snapshot %s to terminal cache with state: %s", snapshotName, state)
 }
 
 // getTerminalSnapshotState returns the terminal state if snapshot is in cache, empty string otherwise
@@ -757,7 +757,7 @@ func (freezeOrch *FreezeOrchestrator) removeTerminalSnapshot(snapshotName string
 	defer freezeOrch.terminalSnapshotMu.Unlock()
 
 	freezeOrch.terminalSnapshotCache.Remove(snapshotName)
-	klog.V(4).Infof("Removed snapshot %s from terminal cache", snapshotName)
+	klog.V(2).Infof("Removed snapshot %s from terminal cache", snapshotName)
 }
 
 // skipHighLatencySnapshotSku checks if the volume's SKU has extended snapshot operation times
