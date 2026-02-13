@@ -74,6 +74,11 @@ type VolumeAttachmentWatcher struct {
 	// Track volumes currently being processed
 	processing     map[string]bool
 	processingLock sync.RWMutex
+
+	// Local cache of VolumeAttachments for this node, populated by the watch.
+	// Eliminates the need for cluster-wide List() calls in the reconciler.
+	vaCache   map[string]*storagev1.VolumeAttachment // key: VA name
+	vaCacheMu sync.RWMutex
 }
 
 // NewVolumeAttachmentWatcher creates a new VolumeAttachmentWatcher
@@ -100,6 +105,7 @@ func NewVolumeAttachmentWatcher(
 		stopCh:        make(chan struct{}),
 		timeout:       time.Duration(timeoutMinutes) * time.Minute,
 		processing:    make(map[string]bool),
+		vaCache:       make(map[string]*storagev1.VolumeAttachment),
 	}
 }
 
@@ -168,8 +174,10 @@ func (w *VolumeAttachmentWatcher) watchVolumeAttachments(ctx context.Context) er
 
 		switch event.Type {
 		case watch.Added, watch.Modified:
+			w.updateVACache(va)
 			w.handleVolumeAttachment(ctx, va)
 		case watch.Deleted:
+			w.removeFromVACache(va.Name)
 			w.handleVolumeAttachmentDeletion(ctx, va)
 		}
 		return false, nil
@@ -487,6 +495,31 @@ func (w *VolumeAttachmentWatcher) sendEvent(va *storagev1.VolumeAttachment, even
 	klog.V(4).Infof("Event sent: %s - %s: %s", eventType, reason, message)
 }
 
+// updateVACache adds or updates a VolumeAttachment in the local cache
+func (w *VolumeAttachmentWatcher) updateVACache(va *storagev1.VolumeAttachment) {
+	w.vaCacheMu.Lock()
+	defer w.vaCacheMu.Unlock()
+	w.vaCache[va.Name] = va.DeepCopy()
+}
+
+// removeFromVACache removes a VolumeAttachment from the local cache
+func (w *VolumeAttachmentWatcher) removeFromVACache(vaName string) {
+	w.vaCacheMu.Lock()
+	defer w.vaCacheMu.Unlock()
+	delete(w.vaCache, vaName)
+}
+
+// snapshotVACache returns a shallow copy of all cached VolumeAttachments
+func (w *VolumeAttachmentWatcher) snapshotVACache() []*storagev1.VolumeAttachment {
+	w.vaCacheMu.RLock()
+	defer w.vaCacheMu.RUnlock()
+	result := make([]*storagev1.VolumeAttachment, 0, len(w.vaCache))
+	for _, va := range w.vaCache {
+		result = append(result, va)
+	}
+	return result
+}
+
 // reconcileLoop periodically checks for timed out freeze operations
 func (w *VolumeAttachmentWatcher) reconcileLoop(ctx context.Context) {
 	defer w.wg.Done()
@@ -506,25 +539,16 @@ func (w *VolumeAttachmentWatcher) reconcileLoop(ctx context.Context) {
 	}
 }
 
-// reconcile checks for VolumeAttachments that need attention
+// reconcile checks for VolumeAttachments that need attention.
+// Uses the local VA cache (populated by the watch) instead of listing all VolumeAttachments cluster-wide.
 func (w *VolumeAttachmentWatcher) reconcile(ctx context.Context) {
-
-	vaList, err := w.kubeClient.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{})
-	if err != nil {
-		klog.Errorf("Failed to list VolumeAttachments during reconciliation: %v", err)
-		return
-	}
+	// Snapshot the current VA cache so we don't hold the lock during processing
+	cachedVAs := w.snapshotVACache()
 
 	// Build map of VolumeAttachments by volume UUID for lookup
 	vaByVolumeUUID := make(map[string]*storagev1.VolumeAttachment)
-	for i := range vaList.Items {
-		va := &vaList.Items[i]
-
+	for _, va := range cachedVAs {
 		if va.Annotations == nil {
-			continue
-		}
-
-		if va.Spec.NodeName != w.nodeName {
 			continue
 		}
 
