@@ -152,6 +152,8 @@ node:
   maxUnavailable: 1
   logLevel: 5
   metricsPort: 29605
+  snapshotConsistencyMode: "best-effort"  # Options: "best-effort", "strict", "none". Should match controller setting.
+  freezeWaitTimeoutMinutes: 2  # Timeout in minutes for freeze operations on the node. Should match controller setting.
   livenessProbe:
     healthPort: 29603
 
