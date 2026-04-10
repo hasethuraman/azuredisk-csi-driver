@@ -18,9 +18,13 @@ package hooks
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sync"
 
 	v1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
@@ -30,7 +34,6 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
-	"k8s.io/utils/ptr"
 )
 
 /*
@@ -49,6 +52,17 @@ If the PreStop hook hangs during its execution, the driver node pod will be forc
 const clusterAutoscalerTaint = "ToBeDeletedByClusterAutoscaler"
 const v1KarpenterTaint = "karpenter.sh/disrupted"
 const v1beta1KarpenterTaint = "karpenter.sh/disruption"
+
+// azureDiskCSIDriver is the attacher/driver name recorded in VolumeAttachment specs.
+const azureDiskCSIDriver = "disk.csi.azure.com"
+
+// kubeletCSIDir is the glob pattern for filesystem CSI volumes mounted on this node.
+// Matches: /var/lib/kubelet/pods/<uid>/volumes/kubernetes.io~csi/<pv-name>/
+const kubeletCSIDir = "/var/lib/kubelet/pods/*/volumes/kubernetes.io~csi/*"
+
+// kubeletCSIBlockDevicesDir is the glob pattern for raw-block CSI volumes mounted on this node.
+// Matches: /var/lib/kubelet/pods/<uid>/volumeDevices/kubernetes.io~csi/<pv-name>/
+const kubeletCSIBlockDevicesDir = "/var/lib/kubelet/pods/*/volumeDevices/kubernetes.io~csi/*"
 
 // drainTaints includes taints used by K8s or autoscalers that signify node draining or pod eviction.
 var drainTaints = map[string]struct{}{
@@ -103,30 +117,36 @@ func isNodeBeingDrained(node *v1.Node) bool {
 func waitForVolumeAttachments(clientset kubernetes.Interface, nodeName string) error {
 	allAttachmentsDeleted := make(chan struct{})
 
+	// Use sync.Once so that concurrent informer events cannot double-close the channel.
+	var once sync.Once
+	signalDone := func() { once.Do(func() { close(allAttachmentsDeleted) }) }
+
 	factory := informers.NewSharedInformerFactory(clientset, 0)
 	informer := factory.Storage().V1().VolumeAttachments().Informer()
 
 	_, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		DeleteFunc: func(obj interface{}) {
-			klog.V(2).Infof("DeleteFunc: VolumeAttachment deleted node %s", nodeName)
 			va, ok := obj.(*storagev1.VolumeAttachment)
 			if !ok {
 				klog.Errorf("UpdateFunc: error asserting object as type VolumeAttachment obj %s", va)
+				return
 			}
+			klog.V(2).Infof("DeleteFunc: VolumeAttachment %s deleted for node %s", va.Name, va.Spec.NodeName)
 			if va.Spec.NodeName == nodeName {
-				if err := checkVolumeAttachments(clientset, nodeName, allAttachmentsDeleted); err != nil {
+				if err := checkVolumeAttachments(clientset, nodeName, signalDone); err != nil {
 					klog.Errorf("checkVolumeAttachments failed: %v", err)
 				}
 			}
 		},
 		UpdateFunc: func(_, newObj interface{}) {
-			klog.V(2).Infof("UpdateFunc: VolumeAttachment updated node %s", nodeName)
 			va, ok := newObj.(*storagev1.VolumeAttachment)
 			if !ok {
 				klog.Errorf("UpdateFunc: error asserting object as type VolumeAttachment obj %s", va)
+				return
 			}
+			klog.V(2).Infof("UpdateFunc: VolumeAttachment %s updated for node %s", va.Name, va.Spec.NodeName)
 			if va.Spec.NodeName == nodeName {
-				if err := checkVolumeAttachments(clientset, nodeName, allAttachmentsDeleted); err != nil {
+				if err := checkVolumeAttachments(clientset, nodeName, signalDone); err != nil {
 					klog.Errorf("checkVolumeAttachments failed: %v", err)
 				}
 			}
@@ -138,7 +158,8 @@ func waitForVolumeAttachments(clientset kubernetes.Interface, nodeName string) e
 
 	go informer.Run(allAttachmentsDeleted)
 
-	if err := checkVolumeAttachments(clientset, nodeName, allAttachmentsDeleted); err != nil {
+	// Run an initial check now; subsequent checks are triggered by informer events.
+	if err := checkVolumeAttachments(clientset, nodeName, signalDone); err != nil {
 		klog.Errorf("checkVolumeAttachments failed: %v", err)
 	}
 
@@ -147,20 +168,78 @@ func waitForVolumeAttachments(clientset kubernetes.Interface, nodeName string) e
 	return nil
 }
 
-func checkVolumeAttachments(clientset kubernetes.Interface, nodeName string, allAttachmentsDeleted chan struct{}) error {
-	allAttachments, err := clientset.StorageV1().VolumeAttachments().List(context.Background(), metav1.ListOptions{TimeoutSeconds: ptr.To(int64(2))})
-	if err != nil {
-		return fmt.Errorf("checkVolumeAttachments: failed to list VolumeAttachments: %w", err)
-	}
-	klog.V(2).Infof("volumeAttachments count: %d, nodeName: %s", len(allAttachments.Items), nodeName)
+// computeVAName returns the deterministic VolumeAttachment name assigned by the
+// Kubernetes attach/detach controller:
+//
+//	"csi-" + hex(sha256(volumeHandle + attacher + nodeName))
 
-	for _, attachment := range allAttachments.Items {
-		if attachment.Spec.NodeName == nodeName {
-			klog.V(2).Infof("isVolumeAttachmentEmpty: not ready to exit, found VolumeAttachment %v node %s", attachment, nodeName)
-			return nil
+func computeVAName(volumeHandle, attacher, nodeName string) string {
+	sum := sha256.Sum256([]byte(volumeHandle + attacher + nodeName))
+	return "csi-" + hex.EncodeToString(sum[:])
+}
+
+// localCSIPVNames returns the deduplicated PV names for CSI volumes currently
+// present in the kubelet's local volume directories on this node. It scans both
+// the filesystem-volume path and the raw-block-volume path:
+
+func localCSIPVNames(globPatterns ...string) ([]string, error) {
+	seen := make(map[string]struct{})
+	var names []string
+	for _, pattern := range globPatterns {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			return nil, fmt.Errorf("localCSIPVNames: glob failed for %s: %w", pattern, err)
+		}
+		for _, m := range matches {
+			name := filepath.Base(m)
+			if _, dup := seen[name]; !dup {
+				seen[name] = struct{}{}
+				names = append(names, name)
+			}
 		}
 	}
+	return names, nil
+}
 
-	close(allAttachmentsDeleted)
+func checkVolumeAttachments(clientset kubernetes.Interface, nodeName string, signalDone func()) error {
+	pvNames, err := localCSIPVNames(kubeletCSIDir, kubeletCSIBlockDevicesDir)
+	if err != nil {
+		return fmt.Errorf("checkVolumeAttachments: failed to list local CSI PVs: %w", err)
+	}
+	klog.V(2).Infof("checkVolumeAttachments: %d local CSI PV(s) found, nodeName: %s", len(pvNames), nodeName)
+
+	for _, pvName := range pvNames {
+		pv, err := clientset.CoreV1().PersistentVolumes().Get(
+			context.Background(), pvName, metav1.GetOptions{})
+		if k8serrors.IsNotFound(err) {
+			// PV already deleted from the API server; no VA can exist for it.
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("checkVolumeAttachments: failed to get PV %s: %w", pvName, err)
+		}
+		if pv.Spec.CSI == nil || pv.Spec.CSI.Driver != azureDiskCSIDriver {
+			continue
+		}
+
+		vaName := computeVAName(pv.Spec.CSI.VolumeHandle, azureDiskCSIDriver, nodeName)
+		_, err = clientset.StorageV1().VolumeAttachments().Get(
+			context.Background(), vaName, metav1.GetOptions{})
+		if err == nil {
+			// VA still exists — not ready to exit yet.
+			klog.V(2).Infof("checkVolumeAttachments: VA %s still exists for PV %s, waiting", vaName, pvName)
+			return nil
+		}
+		if !k8serrors.IsNotFound(err) {
+			klog.Warningf("checkVolumeAttachments: error getting VA %s: %v", vaName, err)
+			return fmt.Errorf("checkVolumeAttachments: error getting VA %s: %w", vaName, err)
+		}
+		// IsNotFound — this VA is already gone.
+		klog.V(2).Infof("checkVolumeAttachments: VA %s for PV %s already removed", vaName, pvName)
+	}
+
+	// Every local PV's VA is gone (or was never an Azure disk VA).
+	klog.V(2).Info("checkVolumeAttachments: no remaining VolumeAttachments found, signaling completion")
+	signalDone()
 	return nil
 }

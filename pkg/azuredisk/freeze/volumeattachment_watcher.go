@@ -29,6 +29,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
@@ -40,6 +41,46 @@ import (
 	"k8s.io/mount-utils"
 	"sigs.k8s.io/azuredisk-csi-driver/pkg/azureconstants"
 )
+
+// kubeletCSIPodsGlob is the glob pattern for filesystem CSI volumes mounted on this node.
+// Matches: /var/lib/kubelet/pods/<uid>/volumes/kubernetes.io~csi/<pv-name>/
+const kubeletCSIPodsGlob = "/var/lib/kubelet/pods/*/volumes/kubernetes.io~csi/*"
+
+// kubeletCSIBlockDevicesGlob is the glob pattern for raw-block CSI volumes mounted on this node.
+// Matches: /var/lib/kubelet/pods/<uid>/volumeDevices/kubernetes.io~csi/<pv-name>/
+const kubeletCSIBlockDevicesGlob = "/var/lib/kubelet/pods/*/volumeDevices/kubernetes.io~csi/*"
+
+// computeVAName returns the deterministic VolumeAttachment name assigned by the
+// Kubernetes attach/detach controller:
+//
+//	"csi-" + hex(sha256(volumeHandle + attacher + nodeName))
+func computeVAName(volumeHandle, attacher, nodeName string) string {
+	sum := sha256.Sum256([]byte(volumeHandle + attacher + nodeName))
+	return "csi-" + hex.EncodeToString(sum[:])
+}
+
+// localCSIPVNames returns the deduplicated PV names for CSI volumes currently
+// present in the kubelet's local volume directories on this node. It scans both
+// the filesystem-volume path and the raw-block-volume path:
+
+func localCSIPVNames(globPatterns ...string) ([]string, error) {
+	seen := make(map[string]struct{})
+	var names []string
+	for _, pattern := range globPatterns {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			return nil, fmt.Errorf("localCSIPVNames: glob failed for %s: %w", pattern, err)
+		}
+		for _, m := range matches {
+			name := filepath.Base(m)
+			if _, dup := seen[name]; !dup {
+				seen[name] = struct{}{}
+				names = append(names, name)
+			}
+		}
+	}
+	return names, nil
+}
 
 const (
 	// Annotation keys
@@ -54,7 +95,8 @@ const (
 	EventReasonUnfreezeFailed       = "UnfreezeFailed"
 	EventReasonInconsistentSnapshot = "InconsistentSnapshot"
 	EventReasonFreezeTimeout        = "FreezeTimeout"
-	EventReasonUserFrozenDetected   = "UserFrozenDetected"
+
+	EventReasonUserFrozenDetected = "UserFrozenDetected"
 
 	// Reconcile interval
 	ReconcileInterval = 1 * time.Minute
@@ -142,13 +184,50 @@ func (w *VolumeAttachmentWatcher) run(ctx context.Context) {
 	}
 }
 
+// buildLocalVAList builds a VolumeAttachmentList for this node by reading the
+// kubelet's local CSI volume directory instead of performing a cluster-wide List.
+func (w *VolumeAttachmentWatcher) buildLocalVAList(ctx context.Context) (*storagev1.VolumeAttachmentList, error) {
+	pvNames, err := localCSIPVNames(kubeletCSIPodsGlob, kubeletCSIBlockDevicesGlob)
+	if err != nil {
+		return nil, err
+	}
+	klog.V(4).Infof("buildLocalVAList: %d local CSI PV(s) found for node %s", len(pvNames), w.nodeName)
+
+	vaList := &storagev1.VolumeAttachmentList{}
+	for _, pvName := range pvNames {
+		pv, err := w.kubeClient.CoreV1().PersistentVolumes().Get(ctx, pvName, metav1.GetOptions{})
+		if k8serrors.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("buildLocalVAList: failed to get PV %s: %w", pvName, err)
+		}
+		if pv.Spec.CSI == nil || pv.Spec.CSI.Driver != azureconstants.DefaultDriverName {
+			continue
+		}
+
+		vaName := computeVAName(pv.Spec.CSI.VolumeHandle, azureconstants.DefaultDriverName, w.nodeName)
+		va, err := w.kubeClient.StorageV1().VolumeAttachments().Get(ctx, vaName, metav1.GetOptions{})
+		if k8serrors.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("buildLocalVAList: failed to get VolumeAttachment %s for PV %s: %w", vaName, pvName, err)
+		}
+		vaList.Items = append(vaList.Items, *va)
+	}
+	return vaList, nil
+}
+
 // watchVolumeAttachments watches VolumeAttachment resources for this node
 func (w *VolumeAttachmentWatcher) watchVolumeAttachments(ctx context.Context) error {
 	// Watch VolumeAttachments for this node only
 
 	lw := &cache.ListWatch{
-		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
-			return w.kubeClient.StorageV1().VolumeAttachments().List(ctx, options)
+		// Use the kubelet's local CSI volume directory to seed the initial list
+		// rather than performing a cluster-wide VolumeAttachment List.
+		ListFunc: func(_ metav1.ListOptions) (runtime.Object, error) {
+			return w.buildLocalVAList(ctx)
 		},
 		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
 			return w.kubeClient.StorageV1().VolumeAttachments().Watch(ctx, options)
