@@ -639,12 +639,15 @@ func TestCreateVolume_SnapshotPremiumLRS_ToPremiumV2_EmitsMigrationEvents(t *tes
 
 	d.getCloud().KubeClient = mockKube
 	eventRecorder := record.NewFakeRecorder(100)
-	d.SetMigrationMonitor(NewMigrationProgressMonitor(d.getCloud().KubeClient, eventRecorder, d.GetDiskController()))
 
-	// Speed up polling
+	// Speed up polling — must set before creating monitor so checkInterval is captured
 	origInterval := migrationCheckInterval
 	migrationCheckInterval = 30 * time.Millisecond
 	defer func() { migrationCheckInterval = origInterval }()
+
+	monitor := NewMigrationProgressMonitor(d.getCloud().KubeClient, eventRecorder, d.GetDiskController())
+	setFastPollIntervals(monitor, 30*time.Millisecond)
+	d.SetMigrationMonitor(monitor)
 
 	// Mock k8s PV/PVC lookup
 	coreMock.CoreV1().(*mockcorev1.MockInterface).EXPECT().PersistentVolumeClaims(gomock.Any()).Return(pvcMock).AnyTimes()
@@ -941,7 +944,9 @@ func TestCreateVolume_RecoveryLoopStartsMigrationAfterInitialMonitorUnavailable(
 	createDone.Store(true)
 
 	eventRecorder := record.NewFakeRecorder(100)
-	d.SetMigrationMonitor(NewMigrationProgressMonitor(d.getCloud().KubeClient, eventRecorder, d.GetDiskController()))
+	recoveryMonitor := NewMigrationProgressMonitor(d.getCloud().KubeClient, eventRecorder, d.GetDiskController())
+	setFastPollIntervals(recoveryMonitor, 25*time.Millisecond)
+	d.SetMigrationMonitor(recoveryMonitor)
 
 	// Prepare labeled PV/PVC for recovery
 	coreMock := d.getCloud().KubeClient.CoreV1().(*mockcorev1.MockInterface)
@@ -1131,6 +1136,10 @@ func TestControllerGetVolume(t *testing.T) {
 }
 
 func TestControllerModifyVolume(t *testing.T) {
+	origInterval := migrationCheckInterval
+	migrationCheckInterval = 20 * time.Millisecond
+	defer func() { migrationCheckInterval = origInterval }()
+
 	tests := []struct {
 		desc                                    string
 		req                                     *csi.ControllerModifyVolumeRequest
@@ -1324,7 +1333,9 @@ func TestControllerModifyVolume(t *testing.T) {
 
 		// Initialize migration monitor with the fake driver's kube client
 		mockEventRecorder := record.NewFakeRecorder(100)
-		d.SetMigrationMonitor(NewMigrationProgressMonitor(d.getCloud().KubeClient, mockEventRecorder, d.GetDiskController()))
+		mon := NewMigrationProgressMonitor(d.getCloud().KubeClient, mockEventRecorder, d.GetDiskController())
+		setFastPollIntervals(mon, 20*time.Millisecond)
+		d.SetMigrationMonitor(mon)
 
 		ctx, cancel := context.WithCancel(context.TODO())
 		defer cancel()
@@ -1624,7 +1635,9 @@ func TestControllerModifyVolume(t *testing.T) {
 			migrationCheckInterval = time.Millisecond * 100 // Speed up migration checks for tests
 
 			// Create new migration monitor (simulating controller restart)
-			drestart.SetMigrationMonitor(NewMigrationProgressMonitor(drestart.getCloud().KubeClient, mockEventRecorder, drestart.GetDiskController()))
+			restartMon := NewMigrationProgressMonitor(drestart.getCloud().KubeClient, mockEventRecorder, drestart.GetDiskController())
+			setFastPollIntervals(restartMon, 20*time.Millisecond)
+			drestart.SetMigrationMonitor(restartMon)
 
 			// Simulate recovery process that would happen on controller startup
 			if test.pvHasMigrationLabels {
@@ -1715,7 +1728,9 @@ func TestControllerModifyVolume_MigrationLifecycleAndTimeout(t *testing.T) {
 
 		d := getFakeDriverWithKubeClient(ctrl)
 		rec := record.NewFakeRecorder(200)
-		d.SetMigrationMonitor(NewMigrationProgressMonitor(d.getCloud().KubeClient, rec, d.GetDiskController()))
+		mon := NewMigrationProgressMonitor(d.getCloud().KubeClient, rec, d.GetDiskController())
+		setFastPollIntervals(mon, baseInterval)
+		d.SetMigrationMonitor(mon)
 
 		// get the last token in testVolumeStr
 		volumeID := strings.Split(testVolumeStr, "/")[len(strings.Split(testVolumeStr, "/"))-1]
@@ -1769,6 +1784,10 @@ func TestControllerModifyVolume_MigrationLifecycleAndTimeout(t *testing.T) {
 	}
 
 	t.Run("lifecycle: start -> milestones -> completion -> label removed", func(t *testing.T) {
+		// Need longer timeout for 11 progress steps at ~20ms each
+		setTiming(baseInterval, 500*time.Millisecond, 600*time.Millisecond)
+		defer setTiming(baseInterval, baseSlabTimeout, baseMaxTimeout)
+
 		ctrl := gomock.NewController(t)
 		defer ctrl.Finish()
 

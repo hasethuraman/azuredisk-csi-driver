@@ -48,6 +48,13 @@ import (
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/mock_azclient"
 )
 
+// setFastPollIntervals configures a monitor for fast polling in tests
+func setFastPollIntervals(m *MigrationProgressMonitor, interval time.Duration) {
+	m.pollIntervalSlowPhase = interval
+	m.pollIntervalNormalPhase = interval
+	m.pollIntervalFastPhase = interval
+}
+
 func TestNewMigrationProgressMonitor(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
@@ -183,8 +190,8 @@ func TestStartMigrationMonitoring(t *testing.T) {
 				assert.Equal(t, tt.pvcNamespace, task.PVCNamespace)
 				assert.Equal(t, string(tt.fromSKU), task.FromSKU)
 				assert.Equal(t, tt.toSKU, task.ToSKU)
-				assert.NotNil(t, task.CancelFunc)
-				assert.NotNil(t, task.Context)
+				assert.NotZero(t, task.MigrationTimeout)
+				assert.NotZero(t, task.CurrentPollInterval)
 
 				// Verify migration started event was recorded
 				select {
@@ -334,6 +341,7 @@ func TestIsMigrationActive(t *testing.T) {
 		}).Times(1)
 
 	monitor := NewMigrationProgressMonitor(mockKubeClient, mockEventRecorder, d.GetDiskController())
+	setFastPollIntervals(monitor, 50*time.Millisecond)
 
 	diskURI := "/subscriptions/test/resourceGroups/rg/providers/Microsoft.Compute/disks/test-disk"
 	nonExistentDiskURI := "/subscriptions/test/resourceGroups/rg/providers/Microsoft.Compute/disks/non-existent"
@@ -415,9 +423,6 @@ func TestEmitMigrationEvent(t *testing.T) {
 	}
 
 	// Create test task
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	task := &MigrationTask{
 		DiskURI:      "/subscriptions/test/resourceGroups/rg/providers/Microsoft.Compute/disks/test-disk",
 		PVName:       "test-pv",
@@ -426,8 +431,6 @@ func TestEmitMigrationEvent(t *testing.T) {
 		FromSKU:      string(armcompute.DiskStorageAccountTypesPremiumLRS),
 		ToSKU:        armcompute.DiskStorageAccountTypesPremiumV2LRS,
 		StartTime:    time.Now(),
-		Context:      ctx,
-		CancelFunc:   cancel,
 	}
 
 	// Set up mocks
@@ -462,9 +465,6 @@ func TestEmitMigrationEvent_PVCNotFound(t *testing.T) {
 	monitor := NewMigrationProgressMonitor(mockKubeClient, mockEventRecorder, mockDiskController)
 
 	// Create test task
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	task := &MigrationTask{
 		DiskURI:      "/subscriptions/test/resourceGroups/rg/providers/Microsoft.Compute/disks/test-disk",
 		PVName:       "test-pv",
@@ -473,8 +473,6 @@ func TestEmitMigrationEvent_PVCNotFound(t *testing.T) {
 		FromSKU:      string(armcompute.DiskStorageAccountTypesPremiumLRS),
 		ToSKU:        armcompute.DiskStorageAccountTypesPremiumV2LRS,
 		StartTime:    time.Now(),
-		Context:      ctx,
-		CancelFunc:   cancel,
 	}
 
 	// Set up mocks to return error
@@ -1958,7 +1956,7 @@ func TestMigrationTimeoutScenarios(t *testing.T) {
 		// Reset global variables and reinitialize
 		initializeTimeouts()
 
-		// Set very fast check interval for testing
+		// Set very fast check and poll intervals for testing
 		migrationCheckInterval = 20 * time.Millisecond
 
 		klog.Infof("Timeouts initialized: %v", migrationTimeouts)
@@ -2056,6 +2054,7 @@ func TestMigrationTimeoutScenarios(t *testing.T) {
 
 		// Create monitor
 		monitor := NewMigrationProgressMonitor(mockKubeClient, mockEventRecorder, d.GetDiskController())
+		setFastPollIntervals(monitor, 20*time.Millisecond)
 		diskURI := "/subscriptions/test/resourceGroups/rg/providers/Microsoft.Compute/disks/test-disk"
 
 		// Start monitoring
@@ -2067,7 +2066,7 @@ func TestMigrationTimeoutScenarios(t *testing.T) {
 		assert.True(t, monitor.IsMigrationActive(diskURI))
 
 		// Wait for migration timeout and completion
-		time.Sleep(400 * time.Millisecond) // Wait long enough for both timeout and completion
+		time.Sleep(600 * time.Millisecond) // Wait long enough for both timeout and completion
 
 		// Collect and verify events
 		events := []string{}
@@ -2111,6 +2110,7 @@ func TestMigrationTimeoutScenarios(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 		assert.False(t, monitor.IsMigrationActive(diskURI))
 		assert.Equal(t, 0, len(monitor.GetActiveMigrations()))
+		monitor.Stop()
 	})
 
 	// Test Case 2: Both timeouts hit - no completion
@@ -2149,7 +2149,7 @@ func TestMigrationTimeoutScenarios(t *testing.T) {
 		klog.Infof("Sorted slab array: %v", sortedMigrationSlabArray)
 		klog.Infof("Max migration timeout: %v", maxMigrationTimeout)
 
-		// Set very fast check interval for testing
+		// Set very fast check and poll intervals for testing
 		migrationCheckInterval = 20 * time.Millisecond
 
 		// Create mocks
@@ -2217,6 +2217,7 @@ func TestMigrationTimeoutScenarios(t *testing.T) {
 
 		// Create monitor
 		monitor := NewMigrationProgressMonitor(mockKubeClient, mockEventRecorder, d.GetDiskController())
+		setFastPollIntervals(monitor, 20*time.Millisecond)
 		diskURI := "/subscriptions/test/resourceGroups/rg/providers/Microsoft.Compute/disks/test-disk"
 
 		// Start monitoring
@@ -2405,6 +2406,7 @@ func TestMigrationThroughProvisioningFlowDelayedPVAndLabelRetry(t *testing.T) {
 		}).AnyTimes()
 
 	monitor := NewMigrationProgressMonitor(mockKube, eventRecorder, d.GetDiskController())
+	setFastPollIntervals(monitor, 20*time.Millisecond)
 	var qty = resource.MustParse("1Gi")
 
 	// provisioningFlow=true: should not require PV initially
@@ -2466,7 +2468,9 @@ func TestMigrationProgressMilestones(t *testing.T) {
 	// Faster polling
 	origInterval := migrationCheckInterval
 	migrationCheckInterval = 10 * time.Millisecond
-	defer func() { migrationCheckInterval = origInterval }()
+	defer func() {
+		migrationCheckInterval = origInterval
+	}()
 
 	mockKube.EXPECT().CoreV1().Return(coreMock).AnyTimes()
 	coreMock.EXPECT().PersistentVolumes().Return(pvMock).AnyTimes()
@@ -2527,6 +2531,7 @@ func TestMigrationProgressMilestones(t *testing.T) {
 	).AnyTimes()
 
 	monitor := NewMigrationProgressMonitor(mockKube, eventRecorder, d.GetDiskController())
+	setFastPollIntervals(monitor, 10*time.Millisecond)
 	qty := resource.MustParse("1Gi")
 
 	err := monitor.StartMigrationMonitoring(context.Background(), false, diskID, "pv-milestones",
@@ -2535,7 +2540,15 @@ func TestMigrationProgressMilestones(t *testing.T) {
 		qty.Value())
 	assert.NoError(t, err)
 
-	time.Sleep(400 * time.Millisecond)
+	// Directly call processTask to drive through the progress sequence without waiting for real intervals
+	monitor.mutex.RLock()
+	task := monitor.activeTasks[diskID]
+	monitor.mutex.RUnlock()
+	assert.NotNil(t, task)
+
+	for monitor.IsMigrationActive(diskID) {
+		monitor.processTask(task)
+	}
 
 	// Collect events
 	var events []string
@@ -2549,7 +2562,7 @@ collect:
 		}
 	}
 
-	// We EXPECT a Started + one or more Progress events + maybe Completed (depending on timing)
+	// We EXPECT a Started + one or more Progress events + Completed
 	startFound := false
 	progressFound := false
 	progressCompleted := false
@@ -2565,12 +2578,8 @@ collect:
 		}
 	}
 
-	// This may currently FAIL due to the (task.PVLabeled && task.PVName == "") condition bug.
 	assert.True(t, progressFound, "expected at least one progress event")
-	// startFound assertion left soft to avoid immediate breakage if bug present:
-	if !startFound {
-		t.Logf("NOTE: Did not observe start event; code may need condition fix (see test).")
-	}
+	assert.True(t, startFound, "expected start event")
 	assert.True(t, progressCompleted, "expected completion event")
 
 	monitor.Stop()
@@ -2590,7 +2599,9 @@ func TestStartMigrationMonitoringIdempotent(t *testing.T) {
 	// Faster polling
 	origInterval := migrationCheckInterval
 	migrationCheckInterval = 10 * time.Millisecond
-	defer func() { migrationCheckInterval = origInterval }()
+	defer func() {
+		migrationCheckInterval = origInterval
+	}()
 
 	mockKube.EXPECT().CoreV1().Return(coreMock).AnyTimes()
 	coreMock.EXPECT().PersistentVolumes().Return(pvMock).AnyTimes()
@@ -2634,6 +2645,7 @@ func TestStartMigrationMonitoringIdempotent(t *testing.T) {
 
 	var qty = resource.MustParse("1Gi")
 	m := NewMigrationProgressMonitor(mockKube, eventRecorder, d.GetDiskController())
+	setFastPollIntervals(m, 10*time.Millisecond)
 	err := m.StartMigrationMonitoring(context.Background(), false, id, "pv-dup",
 		string(armcompute.DiskStorageAccountTypesPremiumLRS), armcompute.DiskStorageAccountTypesPremiumV2LRS,
 		qty.Value())
@@ -2663,7 +2675,9 @@ func TestMigrationMonitorStopCancels(t *testing.T) {
 	// Faster polling
 	origInterval := migrationCheckInterval
 	migrationCheckInterval = 10 * time.Millisecond
-	defer func() { migrationCheckInterval = origInterval }()
+	defer func() {
+		migrationCheckInterval = origInterval
+	}()
 
 	mockKube.EXPECT().CoreV1().Return(coreMock).AnyTimes()
 	coreMock.EXPECT().PersistentVolumes().Return(pvMock).AnyTimes()
@@ -2701,6 +2715,7 @@ func TestMigrationMonitorStopCancels(t *testing.T) {
 
 	var qty = resource.MustParse("1Gi")
 	m := NewMigrationProgressMonitor(mockKube, eventRecorder, d.GetDiskController())
+	setFastPollIntervals(m, 10*time.Millisecond)
 	err := m.StartMigrationMonitoring(context.Background(), false, id, "pv-stop",
 		string(armcompute.DiskStorageAccountTypesPremiumLRS), armcompute.DiskStorageAccountTypesPremiumV2LRS,
 		qty.Value())
@@ -2709,6 +2724,293 @@ func TestMigrationMonitorStopCancels(t *testing.T) {
 	m.Stop()
 	time.Sleep(50 * time.Millisecond)
 	assert.False(t, m.IsMigrationActive(id))
+}
+
+func TestGetAdaptiveInterval(t *testing.T) {
+	// Create a monitor with default intervals for testing
+	monitor := &MigrationProgressMonitor{
+		pollIntervalSlowPhase:   defaultPollIntervalSlowPhase,
+		pollIntervalNormalPhase: defaultPollIntervalNormalPhase,
+		pollIntervalFastPhase:   defaultPollIntervalFastPhase,
+	}
+
+	tests := []struct {
+		name                string
+		progress            float32
+		consecutiveNoChange int
+		expectedInterval    time.Duration
+	}{
+		{
+			name:                "slow phase - no backoff",
+			progress:            10,
+			consecutiveNoChange: 0,
+			expectedInterval:    defaultPollIntervalSlowPhase, // 5min
+		},
+		{
+			name:                "slow phase - with backoff",
+			progress:            5,
+			consecutiveNoChange: 3,
+			expectedInterval:    defaultPollIntervalSlowPhase * time.Duration(backoffMultiplier), // 10min
+		},
+		{
+			name:                "slow phase - backoff capped at max",
+			progress:            5,
+			consecutiveNoChange: 10,
+			expectedInterval:    maxBackoffInterval, // 10min (cap)
+		},
+		{
+			name:                "normal phase - no backoff",
+			progress:            50,
+			consecutiveNoChange: 0,
+			expectedInterval:    defaultPollIntervalNormalPhase, // 60s
+		},
+		{
+			name:                "normal phase - with backoff",
+			progress:            50,
+			consecutiveNoChange: 3,
+			expectedInterval:    defaultPollIntervalNormalPhase * time.Duration(backoffMultiplier), // 120s
+		},
+		{
+			name:                "fast phase - no backoff",
+			progress:            90,
+			consecutiveNoChange: 0,
+			expectedInterval:    defaultPollIntervalFastPhase, // 30s
+		},
+		{
+			name:                "fast phase - with backoff",
+			progress:            95,
+			consecutiveNoChange: 4,
+			expectedInterval:    defaultPollIntervalFastPhase * time.Duration(backoffMultiplier), // 60s
+		},
+		{
+			name:                "boundary 20% is normal phase",
+			progress:            20,
+			consecutiveNoChange: 0,
+			expectedInterval:    defaultPollIntervalNormalPhase,
+		},
+		{
+			name:                "boundary 80% is fast phase",
+			progress:            80,
+			consecutiveNoChange: 0,
+			expectedInterval:    defaultPollIntervalFastPhase,
+		},
+		{
+			name:                "below backoff threshold - no backoff",
+			progress:            50,
+			consecutiveNoChange: 2,
+			expectedInterval:    defaultPollIntervalNormalPhase, // still normal, threshold is 3
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := monitor.getAdaptiveInterval(tt.progress, tt.consecutiveNoChange)
+			assert.Equal(t, tt.expectedInterval, result)
+		})
+	}
+}
+
+func TestShouldPollTask_AdaptiveInterval(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockKube := mockkubeclient.NewMockInterface(ctrl)
+	eventRecorder := record.NewFakeRecorder(10)
+	monitor := NewMigrationProgressMonitor(mockKube, eventRecorder, &ManagedDiskController{})
+	defer monitor.Stop()
+
+	tests := []struct {
+		name               string
+		lastPollTime       time.Time
+		pollInterval       time.Duration
+		expectedShouldPoll bool
+	}{
+		{
+			name:               "zero last poll time - always poll",
+			lastPollTime:       time.Time{},
+			pollInterval:       defaultPollIntervalNormalPhase,
+			expectedShouldPoll: true,
+		},
+		{
+			name:               "recently polled within interval - skip",
+			lastPollTime:       time.Now().Add(-10 * time.Second),
+			pollInterval:       defaultPollIntervalNormalPhase, // 60s
+			expectedShouldPoll: false,
+		},
+		{
+			name:               "past interval - should poll",
+			lastPollTime:       time.Now().Add(-2 * time.Minute),
+			pollInterval:       defaultPollIntervalNormalPhase, // 60s
+			expectedShouldPoll: true,
+		},
+		{
+			name:               "slow phase - recently polled - skip",
+			lastPollTime:       time.Now().Add(-1 * time.Minute),
+			pollInterval:       defaultPollIntervalSlowPhase, // 5min
+			expectedShouldPoll: false,
+		},
+		{
+			name:               "slow phase - past interval - should poll",
+			lastPollTime:       time.Now().Add(-6 * time.Minute),
+			pollInterval:       defaultPollIntervalSlowPhase, // 5min
+			expectedShouldPoll: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			task := &MigrationTask{
+				LastPollTime:        tt.lastPollTime,
+				CurrentPollInterval: tt.pollInterval,
+			}
+			result := monitor.shouldPollTask(task)
+			assert.Equal(t, tt.expectedShouldPoll, result)
+		})
+	}
+}
+
+func TestLastReportedProgressAlwaysUpdated(t *testing.T) {
+	// Verifies that LastReportedProgress is updated even when no milestone event is emitted,
+	// ensuring ConsecutiveNoChange correctly detects stalls for backoff.
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	d := getFakeDriverWithKubeClientForMigration(ctrl)
+	mockKube := d.getCloud().KubeClient.(*mockkubeclient.MockInterface)
+	coreMock := mockcorev1.NewMockInterface(ctrl)
+	pvMock := mockpersistentvolume.NewMockInterface(ctrl)
+	pvcMock := mockpersistentvolumeclaim.NewMockPersistentVolumeClaimInterface(ctrl)
+	eventRecorder := record.NewFakeRecorder(200)
+	diskClient := mock_diskclient.NewMockInterface(ctrl)
+
+	mockKube.EXPECT().CoreV1().Return(coreMock).AnyTimes()
+	coreMock.EXPECT().PersistentVolumes().Return(pvMock).AnyTimes()
+	coreMock.EXPECT().PersistentVolumeClaims("default").Return(pvcMock).AnyTimes()
+
+	pv := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "pv-progress-test"},
+		Spec: corev1.PersistentVolumeSpec{
+			ClaimRef: &corev1.ObjectReference{Name: "pvc-progress-test", Namespace: "default"},
+			Capacity: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")},
+		},
+	}
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-progress-test", Namespace: "default"},
+		Spec:       corev1.PersistentVolumeClaimSpec{VolumeName: "pv-progress-test"},
+	}
+
+	pvMock.EXPECT().Get(gomock.Any(), "pv-progress-test", gomock.Any()).Return(pv.DeepCopy(), nil).AnyTimes()
+	pvMock.EXPECT().Update(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, got *corev1.PersistentVolume, _ metav1.UpdateOptions) (*corev1.PersistentVolume, error) {
+			if got.Labels == nil {
+				got.Labels = map[string]string{}
+			}
+			got.Labels[LabelMigrationInProgress] = "true"
+			return got, nil
+		},
+	).AnyTimes()
+	pvcMock.EXPECT().Get(gomock.Any(), "pvc-progress-test", gomock.Any()).Return(pvc, nil).AnyTimes()
+
+	diskID := "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/disks/disk-progress"
+	name := "disk-progress"
+	state := "Succeeded"
+
+	// Progress sequence: 25% -> 25% -> 25% -> 25% -> 100%
+	// After first poll at 25%, subsequent polls at same value should increment ConsecutiveNoChange.
+	// With our fix, LastReportedProgress is always updated, so stall detection works.
+	sequence := []float32{25, 25, 25, 25, 100}
+	index := -1
+
+	d.getClientFactory().(*mock_azclient.MockClientFactory).
+		EXPECT().GetDiskClientForSub(gomock.Any()).
+		Return(diskClient, nil).AnyTimes()
+
+	diskClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, _, _ string) (*armcompute.Disk, error) {
+			if index < len(sequence)-1 {
+				index++
+			}
+			val := sequence[index]
+			return &armcompute.Disk{
+				ID:   &diskID,
+				Name: &name,
+				Properties: &armcompute.DiskProperties{
+					DiskSizeGB:        ptr.To[int32](1),
+					ProvisioningState: &state,
+					CompletionPercent: &val,
+				},
+			}, nil
+		},
+	).AnyTimes()
+
+	monitor := NewMigrationProgressMonitor(mockKube, eventRecorder, d.GetDiskController())
+	defer monitor.Stop()
+
+	qty := resource.MustParse("1Gi")
+	err := monitor.StartMigrationMonitoring(context.Background(), false, diskID, "pv-progress-test",
+		string(armcompute.DiskStorageAccountTypesPremiumLRS),
+		armcompute.DiskStorageAccountTypesPremiumV2LRS,
+		qty.Value())
+	assert.NoError(t, err)
+
+	// Directly call processTask multiple times to simulate polls without waiting for real intervals
+	monitor.mutex.RLock()
+	task := monitor.activeTasks[diskID]
+	monitor.mutex.RUnlock()
+	assert.NotNil(t, task)
+
+	// First processTask: progress goes to 25%, LastReportedProgress should be 25
+	monitor.processTask(task)
+	task.mutex.RLock()
+	assert.Equal(t, float32(25), task.LastReportedProgress)
+	assert.Equal(t, 0, task.ConsecutiveNoChange) // first poll at 25, previous was 0 -> change detected
+	task.mutex.RUnlock()
+
+	// Second processTask: still 25%, should increment ConsecutiveNoChange
+	monitor.processTask(task)
+	task.mutex.RLock()
+	assert.Equal(t, float32(25), task.LastReportedProgress)
+	assert.Equal(t, 1, task.ConsecutiveNoChange)
+	task.mutex.RUnlock()
+
+	// Third processTask: still 25%
+	monitor.processTask(task)
+	task.mutex.RLock()
+	assert.Equal(t, float32(25), task.LastReportedProgress)
+	assert.Equal(t, 2, task.ConsecutiveNoChange)
+	task.mutex.RUnlock()
+
+	// Fourth processTask: still 25%, now hits maxConsecutiveNoChange=3
+	monitor.processTask(task)
+	task.mutex.RLock()
+	assert.Equal(t, 3, task.ConsecutiveNoChange)
+	// Backoff should now be applied: normalPhase(60s) * 2 = 120s
+	assert.Equal(t, defaultPollIntervalNormalPhase*time.Duration(backoffMultiplier), task.CurrentPollInterval)
+	task.mutex.RUnlock()
+
+	// Fifth processTask: progress jumps to 100%, migration completes
+	monitor.processTask(task)
+	assert.False(t, monitor.IsMigrationActive(diskID), "expected migration to complete")
+
+	// Verify completion event was emitted
+	var events []string
+collect:
+	for {
+		select {
+		case e := <-eventRecorder.Events:
+			events = append(events, e)
+		default:
+			break collect
+		}
+	}
+
+	completedFound := false
+	for _, e := range events {
+		if strings.Contains(e, ReasonSKUMigrationCompleted) {
+			completedFound = true
+		}
+	}
+	assert.True(t, completedFound, "expected completion event")
 }
 
 func TestRecoverMigrationMonitorsFromLabels_VolumeAttributeFiltering(t *testing.T) {
